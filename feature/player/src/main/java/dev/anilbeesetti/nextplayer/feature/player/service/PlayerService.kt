@@ -6,6 +6,7 @@ import android.content.Intent
 import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
@@ -134,6 +135,8 @@ class PlayerService : MediaSessionService() {
     private lateinit var decoderManager: DecoderManager
     private lateinit var trackSelector: DefaultTrackSelector
     private val decoderRecoveryManager = DecoderRecoveryManager()
+
+    private var floatingWindow: FloatingPlayerWindow? = null
 
     private val decoderAnalyticsListener = object : AnalyticsListener {
         override fun onEvents(player: Player, events: AnalyticsListener.Events) {
@@ -408,6 +411,7 @@ class PlayerService : MediaSessionService() {
                     mediaSession?.player?.play()
                     return
                 }
+                hideFloatingWindow(restoreWakeMode = false)
                 mediaSession?.run {
                     player.clearMediaItems()
                     player.stop()
@@ -900,6 +904,51 @@ class PlayerService : MediaSessionService() {
         }
     }
 
+    private fun showFloatingWindow() {
+        if (floatingWindow?.isShowing == true) return
+        val player = mediaSession?.player ?: return
+        if (player.currentMediaItem == null) return
+        if (!Settings.canDrawOverlays(this)) return
+
+        floatingWindow = FloatingPlayerWindow(
+            context = this,
+            player = player,
+            onClose = {
+                hideFloatingWindow()
+                serviceScope.launch { savePositionAndStopSession() }
+            },
+            onOpenFullScreen = ::openPlayerFromFloatingWindow,
+        ).also { window -> window.show() }
+        if (floatingWindow?.isShowing != true) {
+            floatingWindow = null
+            return
+        }
+        // Screen off playback must stay awake for local and network sources alike.
+        (player as? ExoPlayer)?.setWakeMode(C.WAKE_MODE_NETWORK)
+    }
+
+    private fun hideFloatingWindow(restoreWakeMode: Boolean = true) {
+        val window = floatingWindow ?: return
+        floatingWindow = null
+        window.hide()
+        if (restoreWakeMode) {
+            (mediaSession?.player as? ExoPlayer)?.setWakeMode(C.WAKE_MODE_NONE)
+        }
+    }
+
+    private fun openPlayerFromFloatingWindow() {
+        val player = mediaSession?.player ?: return
+        val uri = player.currentMediaItem?.localConfiguration?.uri ?: return
+        val position = player.currentPosition
+        hideFloatingWindow()
+        val intent = Intent(this, PlayerActivity::class.java).apply {
+            data = uri
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra(EXTRA_FLOATING_RESUME_POSITION, position)
+        }
+        runCatching { startActivity(intent) }
+    }
+
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
         mediaSession
 
@@ -909,6 +958,18 @@ class PlayerService : MediaSessionService() {
             if (mediaSession?.player?.currentMediaItem == null) stopSelf(startId)
             // Keep the grant-bearing start record until stop so Android can revoke its grants.
             return START_REDELIVER_INTENT
+        }
+        if (intent?.action == ACTION_SHOW_FLOATING_WINDOW) {
+            if (mediaSession?.player?.currentMediaItem == null) {
+                stopSelf(startId)
+            } else {
+                showFloatingWindow()
+            }
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_HIDE_FLOATING_WINDOW) {
+            hideFloatingWindow(restoreWakeMode = false)
+            return START_NOT_STICKY
         }
         return super.onStartCommand(
             intent,
@@ -1011,6 +1072,7 @@ class PlayerService : MediaSessionService() {
 
     private suspend fun savePositionAndStopSession() {
         cancelPendingMediaItems()
+        hideFloatingWindow(restoreWakeMode = false)
         val generation = ++playbackRequestGeneration
         mediaSession?.run {
             val mediaItem = player.currentMediaItem
@@ -1039,6 +1101,7 @@ class PlayerService : MediaSessionService() {
     override fun onDestroy() {
         cancelPendingMediaItems()
         super.onDestroy()
+        hideFloatingWindow(restoreWakeMode = false)
         artworkLoadJob?.cancel()
         loudnessEnhancer?.release()
         loudnessEnhancer = null

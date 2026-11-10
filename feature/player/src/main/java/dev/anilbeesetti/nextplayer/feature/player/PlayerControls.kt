@@ -43,12 +43,12 @@ fun PlayerControls(
     videoZoomAndContentScaleState: VideoZoomAndContentScaleState,
     progressState: ProgressStateWithTickInterval,
     chaptersState: ChaptersState,
-    isPipSupported: Boolean,
+    isFloatingWindowSupported: Boolean,
     onShowOverlay: (OverlayView) -> Unit,
     onBackClick: () -> Unit,
     onPlayInBackgroundClick: () -> Unit,
     onToggleTimeDisplay: () -> Unit,
-    onPictureInPictureClick: () -> Unit,
+    onFloatingWindowClick: () -> Unit,
     modifier: Modifier = Modifier,
     middleControlsModifier: Modifier = Modifier,
 ) {
@@ -90,7 +90,7 @@ fun PlayerControls(
                         ControlButtonsPosition.RIGHT -> Alignment.End
                     },
                     videoContentScale = videoZoomAndContentScaleState.videoContentScale,
-                    isPipSupported = isPipSupported,
+                    isFloatingWindowSupported = isFloatingWindowSupported,
                     showRemainingTime = playerPreferences.showRemainingTime,
                     onToggleTimeDisplay = onToggleTimeDisplay,
                     onSeek = seekGestureState::onSeek,
@@ -108,7 +108,7 @@ fun PlayerControls(
                     onVideoContentScaleLongClick = {
                         onShowOverlay(OverlayView.VIDEO_CONTENT_SCALE)
                     },
-                    onPictureInPictureClick = onPictureInPictureClick,
+                    onFloatingWindowClick = onFloatingWindowClick,
                 )
             }
         }

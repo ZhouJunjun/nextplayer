@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
 fun rememberMediaController(
     onBeforeRelease: () -> Unit = {},
     onExtrasChanged: (Bundle) -> Unit = {},
+    shouldClearVideoSurface: () -> Boolean = { true },
 ): MediaController? {
     val context = LocalContext.current.applicationContext
     val token = remember(context) {
@@ -39,6 +40,7 @@ fun rememberMediaController(
     var mediaController by remember(context) { mutableStateOf<MediaController?>(value = null) }
     val currentOnBeforeRelease by rememberUpdatedState(newValue = onBeforeRelease)
     val currentOnExtrasChanged by rememberUpdatedState(newValue = onExtrasChanged)
+    val currentShouldClearVideoSurface by rememberUpdatedState(newValue = shouldClearVideoSurface)
 
     LifecycleStartEffect(key1 = context) {
         val future = MediaController.Builder(
@@ -56,7 +58,8 @@ fun rememberMediaController(
         onStopOrDispose {
             connection.cancel()
             try {
-                mediaController?.clearVideoSurface()
+                // The floating window owns the surface while the player is handed off to it.
+                if (currentShouldClearVideoSurface()) mediaController?.clearVideoSurface()
                 // The service outlives these controls; clear suppression while still connected.
                 mediaController?.setIsScrubbingModeEnabled(enabled = false)
                 currentOnBeforeRelease()

@@ -179,8 +179,8 @@
     <string name="format">格式</string>
     <string name="volume_boost_desc">提升音量高達 200%</string>
     <string name="volume_boost">音量增幅器</string>
-    <string name="pip_settings">子母畫面模式</string>
-    <string name="pip_settings_description">輕觸主畫面按鈕時自動切換至迷你播放器</string>
+    <string name="pip_settings">懸浮小窗</string>
+    <string name="pip_settings_description">離開播放頁時自動將影片縮到懸浮小窗</string>
     <string name="open_subtitle">開啟本機字幕</string>
     <string name="no_subtitle_tracks_found">該影片的字幕軌道不可用或不受支援。</string>
     <string name="no_audio_tracks_found">這部影片的音軌無法使用或不支援。</string>
@@ -202,6 +202,7 @@
     <string name="stop_player_session">停止播放器會話</string>
     <string name="background_play">背景播放</string>
     <string name="background_play_description">輕觸主畫面按鈕或鎖定時於背景播放</string>
+    <string name="floating_window_permission_required">請先授予「顯示在其他應用程式上層」權限，才能使用懸浮小窗</string>
     <string name="enable_pip_from_settings">子母畫面已停用。請在設定中啟用以使用此功能。</string>
     <string name="control_buttons_alignment_right">右</string>
     <string name="control_buttons_alignment">控制按鈕對齊</string>

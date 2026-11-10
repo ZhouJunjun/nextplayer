@@ -7,6 +7,7 @@ import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import android.widget.Toast
@@ -41,10 +42,13 @@ import dev.anilbeesetti.nextplayer.core.ui.theme.NextPlayerTheme
 import dev.anilbeesetti.nextplayer.feature.player.extensions.OpenDocumentAtInitialUri
 import dev.anilbeesetti.nextplayer.feature.player.extensions.uriToSubtitleConfiguration
 import dev.anilbeesetti.nextplayer.feature.player.service.CustomCommands
+import dev.anilbeesetti.nextplayer.feature.player.service.EXTRA_FLOATING_RESUME_POSITION
 import dev.anilbeesetti.nextplayer.feature.player.service.PlayerService
 import dev.anilbeesetti.nextplayer.feature.player.service.addAudioTrack
 import dev.anilbeesetti.nextplayer.feature.player.service.addSubtitleTrack
 import dev.anilbeesetti.nextplayer.feature.player.service.decoderServiceState
+import dev.anilbeesetti.nextplayer.feature.player.service.requestHideFloatingWindow
+import dev.anilbeesetti.nextplayer.feature.player.service.requestShowFloatingWindow
 import dev.anilbeesetti.nextplayer.feature.player.service.retainPlaybackUriPermissions
 import dev.anilbeesetti.nextplayer.feature.player.service.setAudioDecoderMode
 import dev.anilbeesetti.nextplayer.feature.player.service.setVideoDecoderMode
@@ -99,6 +103,9 @@ class PlayerActivity : ComponentActivity() {
     private var lastMediaUri: Uri? = null
     private var lastDecoder: DecoderMode? = null
     private var playInBackground: Boolean = false
+    private var handOffToFloatingWindow: Boolean = false
+    private var overlayPermissionRequested: Boolean = false
+    private var pendingFloatingResumePosition: Long = C.TIME_UNSET
     private var isIntentNew: Boolean = true
     private var backgroundLaunchAccepted = false
     private var activityCreated = false
@@ -180,6 +187,10 @@ class PlayerActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         activityCreated = true
         playerApi = request
+        pendingFloatingResumePosition = intent.getLongExtra(
+            EXTRA_FLOATING_RESUME_POSITION,
+            C.TIME_UNSET,
+        )
         if (request.launchInBackground && intent.data == null) {
             playbackFailed = true
             finish()
@@ -222,6 +233,7 @@ class PlayerActivity : ComponentActivity() {
                         PlayerAction.UpdateDecoderServiceState(extras.decoderServiceState()),
                     )
                 },
+                shouldClearVideoSurface = { !handOffToFloatingWindow },
             )
             LaunchedEffect(key1 = player) {
                 if (player == null || !player.isConnected) return@LaunchedEffect
@@ -233,6 +245,8 @@ class PlayerActivity : ComponentActivity() {
                 )
                 if (!playerApi.launchInBackground) player.addListener(playbackStateListener)
                 updateKeepScreenOnFlag()
+                // The full screen player takes the surface back from the floating window.
+                applicationContext.requestHideFloatingWindow()
                 startPlayback()
             }
 
@@ -247,6 +261,7 @@ class PlayerActivity : ComponentActivity() {
                         viewModel = viewModel,
                         player = player,
                         api = playerApi,
+                        onFloatingWindowClick = { enterFloatingWindow() },
                     )
                 }
             }
@@ -391,6 +406,57 @@ class PlayerActivity : ComponentActivity() {
         updateKeepScreenOnFlag()
     }
 
+    /**
+     * Hands the running session over to the floating window. The service keeps playing, so the
+     * video survives the activity and turning the screen off no longer pauses playback.
+     */
+    private fun enterFloatingWindow(): Boolean {
+        if (handOffToFloatingWindow) return true
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(
+                this,
+                coreUiR.string.floating_window_permission_required,
+                Toast.LENGTH_LONG,
+            ).show()
+            openFloatingWindowSettings()
+            return false
+        }
+        handOffToFloatingWindow = true
+        // The session must survive this activity releasing its controller.
+        playInBackground = true
+        applicationContext.requestShowFloatingWindow()
+        finish()
+        return true
+    }
+
+    private fun openFloatingWindowSettings() {
+        overlayPermissionRequested = true
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName"),
+        )
+        runCatching { startActivity(intent) }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        overlayPermissionRequested = false
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (!playerPreferences.autoPip || isFinishing || handOffToFloatingWindow) return
+        if (overlayPermissionRequested) return
+        if (mediaController?.isPlaying != true) return
+        // A document picker also leaves the activity; that is not a request for a floating window.
+        if (subtitleFileSuspendLauncher.isAwaitingResult ||
+            audioFileSuspendLauncher.isAwaitingResult
+        ) {
+            return
+        }
+        enterFloatingWindow()
+    }
+
     private fun startPlayback() {
         val controller = mediaController ?: return
         if (!isIntentNew &&
@@ -408,6 +474,16 @@ class PlayerActivity : ComponentActivity() {
         val hasExplicitPlaylist =
             playerApi.isApiAccess || intent.hasExtra(PlayerApi.API_PLAYLIST) ||
                 intent.hasExtra(PlaylistPlaybackContract.EXTRA_PLAYLIST_ID)
+
+        val floatingResumePosition = pendingFloatingResumePosition
+        if (floatingResumePosition != C.TIME_UNSET && currentUri?.toString() == uri.toString()) {
+            // Back from the floating window: the session still holds this exact item.
+            pendingFloatingResumePosition = C.TIME_UNSET
+            isIntentNew = false
+            controller.seekTo(floatingResumePosition)
+            controller.prepare()
+            return
+        }
         isIntentNew = false
 
         if (shouldResumeExistingPlayback(
@@ -500,9 +576,15 @@ class PlayerActivity : ComponentActivity() {
                 request,
                 mediaItems,
                 mediaItemIndexToPlay,
-                request.position?.toLong() ?: C.TIME_UNSET,
+                request.position?.toLong() ?: consumeFloatingResumePosition(),
             )
         }
+    }
+
+    private fun consumeFloatingResumePosition(): Long {
+        val position = pendingFloatingResumePosition
+        pendingFloatingResumePosition = C.TIME_UNSET
+        return position
     }
 
     private suspend fun startQueue(
@@ -625,6 +707,10 @@ class PlayerActivity : ComponentActivity() {
             playbackRequestJob?.cancel()
             setIntent(intent)
             playerApi = PlayerApi(intent)
+            pendingFloatingResumePosition = intent.getLongExtra(
+                EXTRA_FLOATING_RESUME_POSITION,
+                C.TIME_UNSET,
+            )
             if (playerApi.launchInBackground) mediaController?.removeListener(playbackStateListener)
             isPlaybackFinished = false
             hasPlaybackStarted = false

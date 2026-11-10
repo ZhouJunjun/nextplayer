@@ -55,8 +55,8 @@ internal fun MediaPlayerControls(
     tapGestureState: TapGestureState,
     seekGestureState: SeekGestureState,
     videoZoomAndContentScaleState: VideoZoomAndContentScaleState,
-    isPipSupported: Boolean,
-    onPictureInPictureClick: () -> Unit,
+    isFloatingWindowSupported: Boolean,
+    onFloatingWindowClick: () -> Unit,
     modifier: Modifier = Modifier,
     dpadUpDown: Int? = null,
 ) {
@@ -168,12 +168,12 @@ internal fun MediaPlayerControls(
                     videoZoomAndContentScaleState = videoZoomAndContentScaleState,
                     progressState = progressState,
                     chaptersState = chaptersState,
-                    isPipSupported = isPipSupported,
+                    isFloatingWindowSupported = isFloatingWindowSupported,
                     onShowOverlay = ::showOverlay,
                     onBackClick = { onAction(PlayerAction.NavigateUp) },
                     onPlayInBackgroundClick = { onAction(PlayerAction.PlayInBackground) },
                     onToggleTimeDisplay = { onAction(PlayerAction.ToggleTimeDisplay) },
-                    onPictureInPictureClick = onPictureInPictureClick,
+                    onFloatingWindowClick = onFloatingWindowClick,
                     middleControlsModifier = Modifier.thenIf(condition = isTv) {
                         focusRequester(focusRequester = middleControlsFocusRequester)
                             .onFocusChanged { isMiddleControlsFocused = it.hasFocus }

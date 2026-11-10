@@ -72,14 +72,14 @@ fun ControlsBottomView(
     chaptersState: ChaptersState,
     controlsAlignment: Alignment.Horizontal,
     videoContentScale: VideoContentScale,
-    isPipSupported: Boolean,
+    isFloatingWindowSupported: Boolean,
     showRemainingTime: Boolean,
     onToggleTimeDisplay: () -> Unit,
     onChaptersClick: () -> Unit,
     onVideoContentScaleClick: () -> Unit,
     onVideoContentScaleLongClick: () -> Unit,
     onLockControlsClick: () -> Unit,
-    onPictureInPictureClick: () -> Unit,
+    onFloatingWindowClick: () -> Unit,
     onPlaybackSpeedClick: () -> Unit,
     onPlayInBackgroundClick: () -> Unit,
     onSeek: (Long) -> Unit,
@@ -228,8 +228,8 @@ fun ControlsBottomView(
                     contentDescription = null,
                 )
             }
-            if (isPipSupported) {
-                PlayerButton(onClick = onPictureInPictureClick) {
+            if (isFloatingWindowSupported) {
+                PlayerButton(onClick = onFloatingWindowClick) {
                     Icon(
                         painter = painterResource(R.drawable.ic_pip),
                         contentDescription = null,
@@ -265,14 +265,14 @@ private fun ControlsBottomViewPreview() {
                 ),
                 controlsAlignment = Alignment.Start,
                 videoContentScale = VideoContentScale.BEST_FIT,
-                isPipSupported = true,
+                isFloatingWindowSupported = true,
                 showRemainingTime = false,
                 onToggleTimeDisplay = {},
                 onChaptersClick = {},
                 onVideoContentScaleClick = {},
                 onVideoContentScaleLongClick = {},
                 onLockControlsClick = {},
-                onPictureInPictureClick = {},
+                onFloatingWindowClick = {},
                 onPlaybackSpeedClick = {},
                 onPlayInBackgroundClick = {},
                 onSeek = {},

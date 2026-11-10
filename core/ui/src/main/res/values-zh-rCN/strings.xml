@@ -194,8 +194,8 @@
     <string name="format">格式</string>
     <string name="volume_boost_desc">将音量增强到最大 200%</string>
     <string name="volume_boost">音量增强</string>
-    <string name="pip_settings">画中画模式</string>
-    <string name="pip_settings_description">返回主屏幕时自动切换到迷你播放器</string>
+    <string name="pip_settings">悬浮小窗</string>
+    <string name="pip_settings_description">离开播放页时自动把视频缩到悬浮小窗</string>
     <string name="open_subtitle">打开本地字幕</string>
     <string name="no_subtitle_tracks_found">此视频的字幕不可用或不受支持</string>
     <string name="no_audio_tracks_found">此视频的音轨不可用或不受支持</string>
@@ -219,6 +219,7 @@
     <string name="background_play_description">返回主屏幕或屏幕锁定时在后台播放</string>
     <string name="stop_player_session">停止播放器会话</string>
     <string name="background_play">后台播放</string>
+    <string name="floating_window_permission_required">请先授予「显示在其他应用上层」权限，才能使用悬浮小窗</string>
     <string name="enable_pip_from_settings">已停用画中画。在设置中启用它可使用此功能。</string>
     <string name="loop_mode_one">循环：单文件</string>
     <string name="loop_mode_all">循环：全部</string>
