@@ -15,8 +15,8 @@ android {
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         applicationId = "dev.anilbeesetti.nextplayer"
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -75,13 +75,9 @@ android {
 
             isEnable = !isBuildingBundle
             reset()
-            include(
-                "armeabi-v7a",
-                "arm64-v8a",
-                "x86",
-                "x86_64",
-            )
-            isUniversalApk = true
+            // Only arm64 is packaged; the app is used on arm64 devices only.
+            include("arm64-v8a")
+            isUniversalApk = false
         }
     }
 

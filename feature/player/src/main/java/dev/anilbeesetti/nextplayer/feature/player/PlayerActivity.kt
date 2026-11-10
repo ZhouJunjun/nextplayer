@@ -425,6 +425,9 @@ class PlayerActivity : ComponentActivity() {
         // The session must survive this activity releasing its controller.
         playInBackground = true
         applicationContext.requestShowFloatingWindow()
+        // The floating window belongs to the playback service, so the app itself has to step
+        // aside; without this the activity underneath (the video list) stays in front of it.
+        moveTaskToBack(true)
         finish()
         return true
     }
