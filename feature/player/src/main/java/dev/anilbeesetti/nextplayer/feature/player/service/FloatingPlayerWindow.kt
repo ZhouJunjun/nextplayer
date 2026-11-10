@@ -25,7 +25,6 @@ import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import dev.anilbeesetti.nextplayer.core.ui.R as coreUiR
 import kotlin.math.abs
-import kotlin.math.min
 
 internal const val ACTION_SHOW_FLOATING_WINDOW =
     "dev.anilbeesetti.nextplayer.SHOW_FLOATING_WINDOW"
@@ -41,12 +40,14 @@ private const val PROGRESS_UPDATE_INTERVAL_MS = 500L
 private const val WINDOW_HORIZONTAL_MARGIN_DP = 10
 private const val WINDOW_BOTTOM_MARGIN_DP = 5
 private const val WINDOW_MIN_HEIGHT_DP = 72
-private const val WINDOW_CORNER_RADIUS_DP = 12
+/** The border is drawn in pixels on purpose: one hairline, the same width on every screen. */
+private const val WINDOW_BORDER_WIDTH_PX = 1
+private val WINDOW_BORDER_COLOR = 0xFF9E9E9E.toInt()
 private const val TOP_BUTTON_SIZE_DP = 36
 private const val TOP_BUTTON_PADDING_DP = 11
 private const val TOP_BUTTON_MARGIN_DP = 4
-private const val CENTER_BUTTON_SIZE_DP = 64
-private const val CENTER_BUTTON_PADDING_DP = 16
+private const val CENTER_BUTTON_SIZE_DP = 128
+private const val CENTER_BUTTON_PADDING_DP = 32
 private const val PROGRESS_BAR_HEIGHT_DP = 3f
 private const val PROGRESS_TOUCH_HEIGHT_DP = 18
 private const val PROGRESS_HORIZONTAL_MARGIN_DP = 8
@@ -54,6 +55,11 @@ private const val PROGRESS_BOTTOM_MARGIN_DP = 4
 private const val TRACK_COLOR = 0x66FFFFFF
 private val SURFACE_ATTACH_RETRY_DELAYS_MS = longArrayOf(120, 360, 900)
 private const val DEFAULT_ASPECT_RATIO = 16f / 9f
+
+/** Where the last window position is kept, so the next window opens in the same place. */
+private const val POSITION_PREFERENCES = "floating_player_window"
+private const val KEY_WINDOW_X = "window_x"
+private const val KEY_WINDOW_Y = "window_y"
 
 internal fun Context.requestShowFloatingWindow() {
     runCatching {
@@ -74,17 +80,23 @@ internal fun Context.requestHideFloatingWindow() {
 /**
  * A movable overlay window that renders the session player through a [SurfaceView].
  *
- * A surface view is used on purpose: it is composited straight by SurfaceFlinger, so the app does
- * no per frame work. The trade off is that a surface view lives in its own layer, which means the
- * rounded outline of the window can clip the letterbox area but never the video itself — a texture
- * view would give real rounded corners at the cost of an extra draw and more power per frame.
+ * A surface view is composited straight by SurfaceFlinger, so the app does no per frame work. It is
+ * its own layer, so it cannot be clipped: the window is a plain rectangle and the border is painted
+ * by a view on top of the video instead of a window outline.
  *
- * The controls follow the usual miniature player layout: close in the top start corner, full screen
- * in the top end corner, play/pause in the middle and a seek bar that spans the bottom edge. The
- * window is sized from the video aspect ratio, its width is the screen width minus a small margin,
- * its height never exceeds half of the screen height, and it starts 5dp above the bottom edge.
- * Unlike picture in picture the window is owned by the playback service, so it outlives the player
- * activity and keeps the video on screen when the device screen is turned off.
+ * The controls follow the usual miniature player layout: full screen in the top start corner, close
+ * in the top end corner, a large play/pause in the middle and a seek bar along the bottom edge. The
+ * bar and the buttons are one set: they appear and disappear together. The window always takes the
+ * aspect ratio of the video and is capped by the screen width and half of the screen height, so the
+ * video fills the window edge to edge and the border sits on its edge.
+ *
+ *
+ * The window starts where it was left last time: the last position is stored when a drag finishes,
+ * so the next window opens in the same place. A landscape video is as wide as the screen allows, so
+ * while it is dragged it stays horizontally centered (5dp on each side) and only moves vertically.
+ * While playing the window keeps the screen on, and unlike picture in picture it is owned by the
+ * playback service, so it outlives the player activity and keeps the video on screen when the
+ * device screen is turned off.
  */
 @OptIn(UnstableApi::class)
 internal class FloatingPlayerWindow(
@@ -98,6 +110,8 @@ internal class FloatingPlayerWindow(
     private val handler = Handler(Looper.getMainLooper())
     private val density = context.resources.displayMetrics.density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private val positionPreferences =
+        context.getSharedPreferences(POSITION_PREFERENCES, Context.MODE_PRIVATE)
 
     private var rootView: FrameLayout? = null
     private var videoView: SurfaceView? = null
@@ -136,6 +150,8 @@ internal class FloatingPlayerWindow(
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             updatePlayPauseIcon(isPlaying = isPlaying)
             updateProgress()
+            // The screen is only held awake while something is actually playing.
+            applyKeepScreenOn(keepScreenOn = isPlaying)
             // Controls stay put while paused, they only fade out during playback.
             handler.removeCallbacks(hideControlsRunnable)
             if (isPlaying) {
@@ -153,16 +169,12 @@ internal class FloatingPlayerWindow(
     fun show() {
         if (isShowing || rootView != null) return
 
-        windowX = 0
-        windowY = (WINDOW_BOTTOM_MARGIN_DP * density).toInt()
+        restoreWindowPosition()
         val params = createLayoutParams(
             videoWidth = player.videoSize.width,
             videoHeight = player.videoSize.height,
         )
-        val root = buildRootView(
-            windowWidth = params.width,
-            windowHeight = params.height,
-        )
+        val root = buildRootView()
         if (runCatching { windowManager.addView(root, params) }.isFailure) return
 
         rootView = root
@@ -171,6 +183,7 @@ internal class FloatingPlayerWindow(
         player.addListener(playerListener)
         updatePlayPauseIcon(isPlaying = player.isPlaying)
         updateProgress()
+        applyKeepScreenOn(keepScreenOn = player.isPlaying)
         attachSurface()
         // The player activity clears the surface while it is torn down, so re-attach a few times.
         for (delay in SURFACE_ATTACH_RETRY_DELAYS_MS) {
@@ -184,6 +197,7 @@ internal class FloatingPlayerWindow(
     fun hide() {
         if (!isShowing) return
         isShowing = false
+        persistWindowPosition()
         handler.removeCallbacksAndMessages(null)
         player.removeListener(playerListener)
         // The surface is left alone on purpose: whoever hides this window either already owns the
@@ -204,15 +218,9 @@ internal class FloatingPlayerWindow(
         runCatching { player.setVideoSurfaceView(view) }
     }
 
-    private fun buildRootView(windowWidth: Int, windowHeight: Int): FrameLayout {
+    private fun buildRootView(): FrameLayout {
         val root = FrameLayout(context).apply {
-            background = GradientDrawable().apply {
-                setColor(Color.BLACK)
-                cornerRadius = WINDOW_CORNER_RADIUS_DP * density
-            }
-            // Rounds the window itself: the letterbox bars get rounded corners, the video surface
-            // keeps its own square corners because a surface view is drawn in a separate layer.
-            clipToOutline = true
+            setBackgroundColor(Color.BLACK)
             isClickable = true
             setOnTouchListener { view, event -> handleTouch(view, event) }
         }
@@ -233,13 +241,13 @@ internal class FloatingPlayerWindow(
                 },
             )
         }
-        val (videoWidth, videoHeight) = fitVideoInWindow(
-            containerWidth = windowWidth,
-            containerHeight = windowHeight,
-        )
+        // The window carries the aspect ratio of the video, so the surface fills it edge to edge.
         root.addView(
             video,
-            FrameLayout.LayoutParams(videoWidth, videoHeight, Gravity.CENTER),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
         )
 
         val controls = buildControlsView()
@@ -251,27 +259,29 @@ internal class FloatingPlayerWindow(
             ),
         )
 
-        val progress = SeekProgressView().apply {
-            setFraction(currentFraction())
-        }
+        // A surface view is its own layer, so it would cover any border painted by the window
+        // background. Drawing the frame as a view on top keeps it visible on the window edge.
+        val border = buildBorderView()
         root.addView(
-            progress,
+            border,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                (PROGRESS_TOUCH_HEIGHT_DP * density).toInt(),
-                Gravity.BOTTOM,
-            ).apply {
-                val margin = (PROGRESS_HORIZONTAL_MARGIN_DP * density).toInt()
-                marginStart = margin
-                marginEnd = margin
-                bottomMargin = (PROGRESS_BOTTOM_MARGIN_DP * density).toInt()
-            },
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
         )
 
         videoView = video
         controlsView = controls
-        progressView = progress
         return root
+    }
+
+    private fun buildBorderView(): View = View(context).apply {
+        background = GradientDrawable().apply {
+            setColor(Color.TRANSPARENT)
+            setStroke(WINDOW_BORDER_WIDTH_PX, WINDOW_BORDER_COLOR)
+        }
+        isClickable = false
+        isFocusable = false
     }
 
     /** Drags the window around; a touch without movement toggles the controls as before. */
@@ -298,10 +308,16 @@ internal class FloatingPlayerWindow(
                     hideControls()
                 }
                 if (isDragging) {
-                    windowX = clampX(
-                        value = (dragStartX + deltaX).toInt(),
-                        windowWidth = params.width,
-                    )
+                    // A landscape video already spans the screen width, so it snaps back to the
+                    // horizontal center (5dp on each side) and the drag becomes a vertical move.
+                    windowX = if (isLandscapeVideo()) {
+                        0
+                    } else {
+                        clampX(
+                            value = (dragStartX + deltaX).toInt(),
+                            windowWidth = params.width,
+                        )
+                    }
                     // Y grows upwards from the bottom edge, hence the inverted delta.
                     windowY = clampY(
                         value = (dragStartY - deltaY).toInt(),
@@ -316,6 +332,7 @@ internal class FloatingPlayerWindow(
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (isDragging) {
                     isDragging = false
+                    persistWindowPosition()
                 } else {
                     toggleControls()
                 }
@@ -325,12 +342,31 @@ internal class FloatingPlayerWindow(
     }
 
     /**
-     * Builds an empty full size container that only hosts the buttons, so the icons sit straight on
-     * the video without a scrim behind them. The container itself is not clickable, which lets a
-     * touch that misses a button fall through to the window and start a drag.
+     * Builds an empty full size container that hosts the buttons and the seek bar, so the icons sit
+     * straight on the video without a scrim behind them. Everything lives in the same container on
+     * purpose: the bar and the buttons appear and disappear as one set. The container itself is not
+     * clickable, which lets a touch that misses a control fall through to the window and start a
+     * drag.
      */
     private fun buildControlsView(): FrameLayout {
         val container = FrameLayout(context)
+
+        val progress = SeekProgressView().apply {
+            setFraction(currentFraction())
+        }
+        container.addView(
+            progress,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                (PROGRESS_TOUCH_HEIGHT_DP * density).toInt(),
+                Gravity.BOTTOM,
+            ).apply {
+                val margin = (PROGRESS_HORIZONTAL_MARGIN_DP * density).toInt()
+                marginStart = margin
+                marginEnd = margin
+                bottomMargin = (PROGRESS_BOTTOM_MARGIN_DP * density).toInt()
+            },
+        )
 
         playPauseButton = createButton(
             iconRes = coreUiR.drawable.ic_pause,
@@ -361,7 +397,7 @@ internal class FloatingPlayerWindow(
             ),
         )
         container.addView(
-            closeButton,
+            fullScreenButton,
             FrameLayout.LayoutParams(
                 (TOP_BUTTON_SIZE_DP * density).toInt(),
                 (TOP_BUTTON_SIZE_DP * density).toInt(),
@@ -372,7 +408,7 @@ internal class FloatingPlayerWindow(
             },
         )
         container.addView(
-            fullScreenButton,
+            closeButton,
             FrameLayout.LayoutParams(
                 (TOP_BUTTON_SIZE_DP * density).toInt(),
                 (TOP_BUTTON_SIZE_DP * density).toInt(),
@@ -382,6 +418,7 @@ internal class FloatingPlayerWindow(
                 topMargin = margin
             },
         )
+        progressView = progress
         return container
     }
 
@@ -446,13 +483,8 @@ internal class FloatingPlayerWindow(
 
     private fun resizeWindow(videoWidth: Int, videoHeight: Int) {
         val root = rootView ?: return
-        val video = videoView ?: return
         val params = createLayoutParams(videoWidth = videoWidth, videoHeight = videoHeight)
-        val (width, height) = fitVideoInWindow(
-            containerWidth = params.width,
-            containerHeight = params.height,
-        )
-        video.layoutParams = FrameLayout.LayoutParams(width, height, Gravity.CENTER)
+        // The video fills the window, which already carries the new aspect ratio.
         layoutParams = params
         runCatching { windowManager.updateViewLayout(root, params) }
     }
@@ -463,11 +495,23 @@ internal class FloatingPlayerWindow(
     ): WindowManager.LayoutParams {
         val screenWidth = screenSize().first
         val screenHeight = screenSize().second
-        val width = (screenWidth - WINDOW_HORIZONTAL_MARGIN_DP * density).toInt().coerceAtLeast(1)
-        val height = min(
-            (width / aspectRatio(videoWidth = videoWidth, videoHeight = videoHeight)).toInt(),
-            screenHeight / 2,
-        ).coerceAtLeast((WINDOW_MIN_HEIGHT_DP * density).toInt())
+        val aspect = aspectRatio(videoWidth = videoWidth, videoHeight = videoHeight)
+        // Start from the widest window the screen allows, then shrink it when the video is taller
+        // than that. Both the width and the height follow the video, so it fills the window.
+        val maxWidth = (screenWidth - WINDOW_HORIZONTAL_MARGIN_DP * density)
+            .toInt()
+            .coerceAtLeast(1)
+        val maxHeight = (screenHeight / 2).coerceAtLeast(1)
+        var width = maxWidth
+        var height = (width / aspect).toInt()
+        if (height > maxHeight) {
+            height = maxHeight
+            width = (height * aspect).toInt()
+        }
+        height = height
+            .coerceAtLeast((WINDOW_MIN_HEIGHT_DP * density).toInt())
+            .coerceAtMost(maxHeight)
+        width = width.coerceAtLeast(1)
 
         return WindowManager.LayoutParams(
             width,
@@ -477,9 +521,36 @@ internal class FloatingPlayerWindow(
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            x = clampX(value = windowX, windowWidth = width)
+            x = if (isLandscapeVideo()) 0 else clampX(value = windowX, windowWidth = width)
             y = clampY(value = windowY, windowHeight = height)
+            if (player.isPlaying) flags = flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         }
+    }
+
+    /** Adds or removes the keep screen on flag without rebuilding the window. */
+    private fun applyKeepScreenOn(keepScreenOn: Boolean) {
+        val params = layoutParams ?: return
+        val root = rootView ?: return
+        val flag = WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        val flags = if (keepScreenOn) params.flags or flag else params.flags and flag.inv()
+        if (flags == params.flags) return
+        params.flags = flags
+        runCatching { windowManager.updateViewLayout(root, params) }
+    }
+
+    private fun restoreWindowPosition() {
+        windowX = positionPreferences.getInt(KEY_WINDOW_X, 0)
+        windowY = positionPreferences.getInt(
+            KEY_WINDOW_Y,
+            (WINDOW_BOTTOM_MARGIN_DP * density).toInt(),
+        )
+    }
+
+    private fun persistWindowPosition() {
+        positionPreferences.edit()
+            .putInt(KEY_WINDOW_X, windowX)
+            .putInt(KEY_WINDOW_Y, windowY)
+            .apply()
     }
 
     private fun clampX(value: Int, windowWidth: Int): Int {
@@ -492,20 +563,6 @@ internal class FloatingPlayerWindow(
         return value.coerceIn(0, limit)
     }
 
-    /** Fits the video inside the window without distorting it. */
-    private fun fitVideoInWindow(containerWidth: Int, containerHeight: Int): Pair<Int, Int> {
-        val width = containerWidth.coerceAtLeast(1)
-        val height = containerHeight.coerceAtLeast(1)
-        val aspect = aspectRatio()
-        var fittedWidth = width
-        var fittedHeight = (width / aspect).toInt()
-        if (fittedHeight > height) {
-            fittedHeight = height
-            fittedWidth = (height * aspect).toInt()
-        }
-        return fittedWidth.coerceAtLeast(1) to fittedHeight.coerceAtLeast(1)
-    }
-
     private fun aspectRatio(
         videoWidth: Int = player.videoSize.width,
         videoHeight: Int = player.videoSize.height,
@@ -514,6 +571,9 @@ internal class FloatingPlayerWindow(
     } else {
         DEFAULT_ASPECT_RATIO
     }
+
+    /** A landscape (or square) video takes the whole window width, so it cannot slide sideways. */
+    private fun isLandscapeVideo(): Boolean = aspectRatio() >= 1f
 
     private fun screenSize(): Pair<Int, Int> {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -533,7 +593,8 @@ internal class FloatingPlayerWindow(
 
     /**
      * The thin bar along the bottom edge. It is only a few dp tall but grabs a taller touch band, so
-     * dragging the bar scrubs the video while the rest of the window keeps moving the window.
+     * dragging the bar scrubs the video while the rest of the window keeps moving the window. It is
+     * part of the controls container, so it fades out together with the buttons.
      */
     private inner class SeekProgressView : View(context) {
 
