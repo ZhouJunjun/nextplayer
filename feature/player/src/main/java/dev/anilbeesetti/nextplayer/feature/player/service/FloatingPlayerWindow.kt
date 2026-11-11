@@ -86,9 +86,10 @@ internal fun Context.requestHideFloatingWindow() {
  *
  * The controls follow the usual miniature player layout: full screen in the top start corner, close
  * in the top end corner, a large play/pause in the middle and a seek bar along the bottom edge. The
- * bar and the buttons are one set: they appear and disappear together. The window always takes the
- * aspect ratio of the video and is capped by the screen width and half of the screen height, so the
- * video fills the window edge to edge and the border sits on its edge.
+ * bar and the buttons are one set: they appear and disappear together. The size of the window is
+ * picked by the orientation of the video: a landscape or square video is as wide as the screen minus
+ * a small margin, a portrait video is half of the screen tall, and the other dimension always follows
+ * the aspect ratio, so the video fills the window edge to edge and the border sits on its edge.
  *
  *
  * The window starts where it was left last time: the last position is stored when a drag finishes,
@@ -496,22 +497,41 @@ internal class FloatingPlayerWindow(
         val screenWidth = screenSize().first
         val screenHeight = screenSize().second
         val aspect = aspectRatio(videoWidth = videoWidth, videoHeight = videoHeight)
-        // Start from the widest window the screen allows, then shrink it when the video is taller
-        // than that. Both the width and the height follow the video, so it fills the window.
+        // The widest window the screen allows, and the tallest a window is allowed to get.
         val maxWidth = (screenWidth - WINDOW_HORIZONTAL_MARGIN_DP * density)
             .toInt()
             .coerceAtLeast(1)
-        val maxHeight = (screenHeight / 2).coerceAtLeast(1)
-        var width = maxWidth
-        var height = (width / aspect).toInt()
-        if (height > maxHeight) {
-            height = maxHeight
+        val halfHeight = (screenHeight / 2).coerceAtLeast(1)
+        val minHeight = (WINDOW_MIN_HEIGHT_DP * density).toInt()
+
+        // A landscape or square video always takes the full available width, a portrait video
+        // always takes half of the screen height; the other dimension follows the aspect ratio, so
+        // the video fills the window edge to edge without being stretched.
+        var width: Int
+        var height: Int
+        if (aspect >= 1f) {
+            width = maxWidth
+            height = (width / aspect).toInt()
+        } else {
+            height = halfHeight
             width = (height * aspect).toInt()
         }
-        height = height
-            .coerceAtLeast((WINDOW_MIN_HEIGHT_DP * density).toInt())
-            .coerceAtMost(maxHeight)
+        // Keep the window usable and inside the screen; both dimensions are recomputed together so
+        // the window never drifts away from the aspect ratio of the video.
+        if (height < minHeight) {
+            height = minHeight
+            width = (height * aspect).toInt()
+        }
+        if (height > screenHeight) {
+            height = screenHeight
+            width = (height * aspect).toInt()
+        }
+        if (width > maxWidth) {
+            width = maxWidth
+            height = (width / aspect).toInt()
+        }
         width = width.coerceAtLeast(1)
+        height = height.coerceAtLeast(1)
 
         return WindowManager.LayoutParams(
             width,
