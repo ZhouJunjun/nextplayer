@@ -10,11 +10,14 @@
 #   PREFIX=/opt/tools sh pack.sh     # init_env.sh 装到了自定义前缀时
 #   BUILD_USER=other sh pack.sh      # 业务用户名不是 itdev 时
 #   CPU_LIMIT=2 MEM_LIMIT_MB=2048 sh pack.sh   # 临时再压低编译用的资源
+#   KOTLIN_STRATEGY=daemon sh pack.sh          # Kotlin 编译改回独立守护进程（默认 in-process）
 #
 # 资源上限（默认）：
-#   内存 4G —— 拆成 Gradle 堆 2G + 元空间 0.375G、Kotlin 守护进程 0.5G + 0.25G，
-#              其余留给 JVM 开销；能拿到 systemd user manager 时再加 cgroup MemoryMax 硬限
-#   CPU  4 核 —— 机器共 8 核，构建只绑 0-3，另外 4 核留给别的服务；同时 Gradle 并发数 = 4
+#   内存 4G —— 单个 JVM：Gradle 堆 2.5G + 元空间 0.375G，Kotlin 编译跑在这个堆里
+#              （4G 装不下两个 JVM：Gradle 2G + Kotlin 守护进程实测 Compose 编译器 OOM）；
+#              能拿到 systemd user manager 时再加 cgroup MemoryMax 硬限
+#   CPU  4 核 —— 机器共 8 核，构建只绑 0-3，另外 4 核留给别的服务；
+#              Gradle 并发 --max-workers=2（in-process 时多个 Kotlin 编译共用一个堆）
 #
 # 做什么：
 #   1. 检查 JDK / Gradle / Android SDK 是否已在 $PREFIX 就位，缺了就提示去跑 init_env.sh
@@ -62,13 +65,27 @@ CPU_LIMIT="${CPU_LIMIT:-4}"
 # 前置成阿里云镜像，镜像里没有的构件仍回落到原仓库。MIRROR=off 可关掉。
 MIRROR="${MIRROR:-on}"
 
-# 4G 预算怎么分（cgroup 算的是实际 RSS，比堆大：还有元空间、代码缓存、线程栈、直接内存）：
-# Gradle 主进程 2G 堆 + 0.375G 元空间，Kotlin 守护进程 0.5G + 0.25G，合计 3.125G，
-# 留约 0.9G 给 JVM 自身开销。上一版合计 3.5G、余量太薄，R8 阶段被 cgroup OOM 杀掉过。
-GRADLE_HEAP_MB=$((MEM_LIMIT_MB / 2))
+# Kotlin 编译策略：in-process / daemon
+# 4G 里塞不下"Gradle 一个 JVM + Kotlin 一个 JVM"：Gradle 堆要 2G 以上（R8 吃堆），
+# Kotlin 守护进程 512M 时实测 Compose 编译器直接 OutOfMemoryError: GC overhead limit exceeded，
+# 两份加起来再算 RSS 必然超 4G。in-process 把 Kotlin 编译放进 Gradle 自己那个堆里，
+# 只剩一个 JVM。要退回老办法：KOTLIN_STRATEGY=daemon sh pack.sh
+KOTLIN_STRATEGY="${KOTLIN_STRATEGY:-in-process}"
+
+# 4G 预算（cgroup 算 RSS，比堆大：还有元空间、代码缓存、线程栈、直接内存）：
+# in-process 只有一份 JVM —— Gradle 堆 2.5G + 元空间 0.375G，其余约 1G 留给 JVM 开销。
+GRADLE_HEAP_MB=$((MEM_LIMIT_MB * 5 / 8))
 GRADLE_META_MB=$((MEM_LIMIT_MB * 3 / 32))
-KOTLIN_HEAP_MB=$((MEM_LIMIT_MB / 8))
+# 只有 daemon 策略才用到这两项
+KOTLIN_HEAP_MB=$((MEM_LIMIT_MB / 4))
 KOTLIN_META_MB=$((MEM_LIMIT_MB / 16))
+
+# 并发数：in-process 时多个 Kotlin 编译共用一个堆，默认压到 2，否则容易把堆吃穿。
+if [ "$KOTLIN_STRATEGY" = "in-process" ]; then
+    WORKERS="${WORKERS:-2}"
+else
+    WORKERS="${WORKERS:-$CPU_LIMIT}"
+fi
 
 # ============================================================ 路径
 
@@ -327,8 +344,14 @@ setup_limits() {
         warn "没有 taskset，只用 Gradle 并发数（$CPU_LIMIT）限制 CPU"
     fi
 
-    say "内存：Gradle 堆 ${GRADLE_HEAP_MB}M + 元空间 ${GRADLE_META_MB}M，" \
-        "Kotlin 守护进程 ${KOTLIN_HEAP_MB}M + ${KOTLIN_META_MB}M"
+    if [ "$KOTLIN_STRATEGY" = "in-process" ]; then
+        say "内存：Gradle 堆 ${GRADLE_HEAP_MB}M + 元空间 ${GRADLE_META_MB}M，" \
+            "Kotlin 编译在进程内（不另开守护进程）"
+    else
+        say "内存：Gradle 堆 ${GRADLE_HEAP_MB}M + 元空间 ${GRADLE_META_MB}M，" \
+            "Kotlin 守护进程 ${KOTLIN_HEAP_MB}M + ${KOTLIN_META_MB}M"
+    fi
+    say "并发：--max-workers=${WORKERS}（Kotlin 策略 ${KOTLIN_STRATEGY}）"
 }
 
 # 把 Gradle 的任务名翻译成人话，心跳时显示更有用
@@ -374,12 +397,21 @@ gradle_with_progress() {
         mirror_args=(--init-script "$MIRROR_INIT")
     fi
 
+    # Kotlin 编译策略：in-process 不再单开守护进程，也就没有那份额外内存
+    local kotlin_args=(-Dkotlin.compiler.execution.strategy=in-process)
+    if [ "$KOTLIN_STRATEGY" = "daemon" ]; then
+        kotlin_args=(
+            -Dkotlin.compiler.execution.strategy=daemon
+            "-Dkotlin.daemon.jvm.options=-Xmx${KOTLIN_HEAP_MB}m,-XX:MaxMetaspaceSize=${KOTLIN_META_MB}m"
+        )
+    fi
+
     "${LIMITER[@]}" "${TASKSET[@]}" "$GRADLE_HOME/bin/gradle" assembleRelease \
         --console=plain --no-daemon \
-        "--max-workers=$CPU_LIMIT" \
+        "--max-workers=$WORKERS" \
         "${mirror_args[@]}" \
+        "${kotlin_args[@]}" \
         "-Dorg.gradle.jvmargs=-Xmx${GRADLE_HEAP_MB}m -XX:MaxMetaspaceSize=${GRADLE_META_MB}m -Dfile.encoding=UTF-8" \
-        "-Dkotlin.daemon.jvm.options=-Xmx${KOTLIN_HEAP_MB}m,-XX:MaxMetaspaceSize=${KOTLIN_META_MB}m" \
         >>"$log" 2>&1 &
     pid=$!
 
@@ -537,12 +569,21 @@ build_apk() {
     sudo journalctl -k | grep -i -E 'oom|killed process' | tail -5
   确实是被杀：把上限放宽再试一次
     MEM_LIMIT_MB=6144 sh pack.sh
-  要守住 4G：把 R8 阶段的并发降下来
-    CPU_LIMIT=2 sh pack.sh" ;;
+  要守住 4G：把并发再压一档
+    WORKERS=1 sh pack.sh" ;;
             143)
                 hint="退出码 143 = 被 SIGTERM 杀掉，多半是手工 Ctrl+C 或 SSH 会话断开导致整棵进程树被回收。" ;;
             1)
-                hint="退出码 1 = Gradle 自己报错，原因见上面日志里的 FAILURE 段。" ;;
+                if grep -q "OutOfMemoryError\|GC overhead limit exceeded" "$CACHE_ROOT/gradle-build.log" 2>/dev/null; then
+                    hint="退出码 1，日志里有 OutOfMemoryError —— 是 JVM 堆不够，不是编译代码有问题。
+  想让 Kotlin 单独用大堆（会多占内存，4G 上限可能装不下）：
+    KOTLIN_STRATEGY=daemon sh pack.sh
+  想整体放宽上限再编：
+    MEM_LIMIT_MB=6144 sh pack.sh"
+                else
+                    hint="退出码 1 = Gradle 自己报错，原因见上面日志里的 FAILURE 段。"
+                fi
+                ;;
         esac
 
         if [ -n "$hint" ]; then
