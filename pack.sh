@@ -507,6 +507,8 @@ gradle_with_progress() {
         "-Dorg.gradle.jvmargs=-Xmx${GRADLE_HEAP_MB}m -XX:MaxMetaspaceSize=${GRADLE_META_MB}m -Dfile.encoding=UTF-8" \
         >>"$log" 2>&1 &
     pid=$!
+    # 阶段名要落回"编译"，否则会被 setup_limits 的 "设置资源上限" 覆盖掉
+    RUN_STAGE="编译 release（Gradle）"
     # 记下 pid：上次的 toolchain 下载锁就是被残留的旧构建进程占着，方便下次 kill
     printf '%s\n' "$pid" >"$CACHE_ROOT/build.pid" 2>/dev/null || true
 
@@ -676,12 +678,24 @@ build_apk() {
             143)
                 hint="退出码 143 = 被 SIGTERM 杀掉，多半是手工 Ctrl+C 或 SSH 会话断开导致整棵进程树被回收。" ;;
             1)
+                local last_done
+                last_done="$(cat "$LAST_TASK_FILE" 2>/dev/null || true)"
                 if grep -q "OutOfMemoryError\|GC overhead limit exceeded" "$CACHE_ROOT/gradle-build.log" 2>/dev/null; then
-                    hint="退出码 1，日志里有 OutOfMemoryError —— 是 JVM 堆不够，不是编译代码有问题。
+                    case "$last_done" in
+                        *minifyReleaseWithR8*|*minifyRelease*)
+                            hint="退出码 1，R8（${last_done}）阶段 OutOfMemoryError —— R8 要把全部 class 读进同一个堆，
+  压缩阶段比编译阶段更吃内存，${GRADLE_HEAP_MB}M 不够。
+  先放宽上限确认（只是内存，不占 CPU）：
+    MEM_LIMIT_MB=6144 sh pack.sh
+  必须守住 4G 时，让 R8 独占堆、不与别的任务并发：
+    WORKERS=1 sh pack.sh" ;;
+                        *)
+                            hint="退出码 1，日志里有 OutOfMemoryError —— 是 JVM 堆不够，不是编译代码有问题。
   想让 Kotlin 单独用大堆（会多占内存，4G 上限可能装不下）：
     KOTLIN_STRATEGY=daemon sh pack.sh
   想整体放宽上限再编：
-    MEM_LIMIT_MB=6144 sh pack.sh"
+    MEM_LIMIT_MB=6144 sh pack.sh" ;;
+                    esac
                 else
                     hint="退出码 1 = Gradle 自己报错，原因见上面日志里的 FAILURE 段。"
                 fi
