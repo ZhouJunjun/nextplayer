@@ -178,18 +178,22 @@ check_toolchain() {
         warn "缺 Gradle：$GRADLE_HOME"; missing=1
     fi
 
-    if [ -f "$SDK_HOME/platforms/$PLATFORM_ID/android.jar" ]; then
+    # 光有 android.jar 不够：缺 package.xml 时 Gradle 会认为组件没装，
+    # 进而尝试写入只读的 SDK 目录，报 "The SDK directory is not writable"
+    if [ -f "$SDK_HOME/platforms/$PLATFORM_ID/android.jar" ] &&
+        [ -f "$SDK_HOME/platforms/$PLATFORM_ID/package.xml" ]; then
         ok "platform $PLATFORM_ID"
     else
-        warn "缺 platform：$SDK_HOME/platforms/$PLATFORM_ID"; missing=1
+        warn "platform $PLATFORM_ID 缺失或不完整（缺 android.jar 或 package.xml）"; missing=1
     fi
 
     local v
     for v in "${REQUIRED_BUILD_TOOLS[@]}"; do
-        if [ -x "$SDK_HOME/build-tools/$v/apksigner" ]; then
+        if [ -x "$SDK_HOME/build-tools/$v/apksigner" ] &&
+            [ -f "$SDK_HOME/build-tools/$v/package.xml" ]; then
             ok "build-tools $v"
         else
-            warn "缺 build-tools $v：$SDK_HOME/build-tools/$v"; missing=1
+            warn "build-tools $v 缺失或不完整（缺 apksigner 或 package.xml）"; missing=1
         fi
     done
 

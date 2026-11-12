@@ -266,6 +266,64 @@ ensure_gradle() {
 # ============================================================ Android SDK
 
 # 直接解压 SDK 官方 zip，不走 sdkmanager —— 不依赖它的换源能力，最稳
+# 生成 SDK 的 package.xml。
+#
+# SDK 官方 zip 里没有 package.xml（那是 sdkmanager 安装时生成的元数据），
+# 而 Gradle 靠它判断组件是否已安装。缺了就会尝试"安装"，写不进只读的 SDK 目录
+# 就报 "The SDK directory is not writable"。
+#
+# 已实测：这个精简版（不含完整许可证文本）Gradle 完全接受。
+# 参数：<目录> <localPackage path> <platform 的 api-level 或空>
+write_platform_package_xml() {
+    local dir="$1" path="$2" api="$3"
+    cat > "$dir/package.xml" <<XML
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02" xmlns:ns6="http://schemas.android.com/sdk/android/repo/repository2/04">
+    <license id="android-sdk-license" type="text">accepted</license>
+    <localPackage path="$path" obsolete="false">
+        <type-details xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="ns6:platformDetailsType">
+            <api-level>$api</api-level>
+            <codename></codename>
+            <extension-level>22</extension-level>
+            <base-extension>true</base-extension>
+            <layoutlib api="15"/>
+        </type-details>
+        <revision>
+            <major>1</major>
+        </revision>
+        <display-name>Android SDK Platform $api</display-name>
+        <uses-license ref="android-sdk-license"/>
+    </localPackage>
+</ns2:repository>
+XML
+}
+
+write_buildtools_package_xml() {
+    local dir="$1" path="$2" ver="$3"
+    local major minor micro
+    major="${ver%%.*}"
+    local rest="${ver#*.}"
+    minor="${rest%%.*}"
+    micro="${rest#*.}"
+
+    cat > "$dir/package.xml" <<XML
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ns2:repository xmlns:ns2="http://schemas.android.com/repository/android/common/02" xmlns:ns5="http://schemas.android.com/sdk/android/repo/repository2/04">
+    <license id="android-sdk-license" type="text">accepted</license>
+    <localPackage path="$path" obsolete="false">
+        <type-details xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="ns5:genericDetailsType"/>
+        <revision>
+            <major>$major</major>
+            <minor>$minor</minor>
+            <micro>$micro</micro>
+        </revision>
+        <display-name>Android SDK Build-Tools $major</display-name>
+        <uses-license ref="android-sdk-license"/>
+    </localPackage>
+</ns2:repository>
+XML
+}
+
 ensure_sdk() {
     step "Android SDK"
 
@@ -276,6 +334,26 @@ ensure_sdk() {
     local v all_bt_ok=1
     for v in "${BUILD_TOOLS_VERS[@]}"; do
         [ -x "$SDK_HOME/build-tools/$v/apksigner" ] || all_bt_ok=0
+    done
+
+    # 目录在但缺 package.xml（早期版本用解压 zip 的方式装的都会有这个问题），
+    # 补上就行，不用重下。Gradle 靠它判断组件是否已安装。
+    local fixed=0
+    if [ "$platform_ok" = 1 ] && [ ! -f "$SDK_HOME/platforms/$PLATFORM_ID/package.xml" ]; then
+        write_platform_package_xml \
+            "$SDK_HOME/platforms/$PLATFORM_ID" \
+            "platforms;$PLATFORM_ID" \
+            "${PLATFORM_ID#android-}"
+        fixed=1
+        ok "补写 platform $PLATFORM_ID 的 package.xml"
+    fi
+    for v in "${BUILD_TOOLS_VERS[@]}"; do
+        if [ -x "$SDK_HOME/build-tools/$v/apksigner" ] &&
+            [ ! -f "$SDK_HOME/build-tools/$v/package.xml" ]; then
+            write_buildtools_package_xml "$SDK_HOME/build-tools/$v" "build-tools;$v" "$v"
+            fixed=1
+            ok "补写 build-tools $v 的 package.xml"
+        fi
     done
 
     if [ "$platform_ok" = 1 ] && [ "$all_bt_ok" = 1 ]; then
@@ -302,6 +380,11 @@ ensure_sdk() {
         mv "$tmp/x/$PLATFORM_ID" "$SDK_HOME/platforms/$PLATFORM_ID"
         [ -f "$SDK_HOME/platforms/$PLATFORM_ID/android.jar" ] ||
             die "platform 安装后找不到 android.jar"
+        # zip 里没有 package.xml，补一个，否则 Gradle 会认为没安装
+        write_platform_package_xml \
+            "$SDK_HOME/platforms/$PLATFORM_ID" \
+            "platforms;$PLATFORM_ID" \
+            "${PLATFORM_ID#android-}"
         ok "platform 完成"
     fi
 
@@ -330,6 +413,7 @@ ensure_sdk() {
         chmod +x "$SDK_HOME/build-tools/$v"/{aapt2,apksigner,zipalign} 2>/dev/null || true
         [ -x "$SDK_HOME/build-tools/$v/apksigner" ] ||
             die "build-tools $v 安装后找不到 apksigner"
+        write_buildtools_package_xml "$SDK_HOME/build-tools/$v" "build-tools;$v" "$v"
         ok "build-tools $v 完成"
     done
 
@@ -373,9 +457,7 @@ ensure_sdk_licenses() {
         if [ -f "$dir/$f" ] && grep -qxF "$hash" "$dir/$f" 2>/dev/null; then
             continue
         fi
-        printf '
-%s
-' "$hash" >> "$dir/$f"
+        printf '\n%s\n' "$hash" >> "$dir/$f"
         chown -R "$(stat -c %U "$SDK_HOME"):" "$dir" 2>/dev/null || true
         changed=1
     done <<'EOF'
