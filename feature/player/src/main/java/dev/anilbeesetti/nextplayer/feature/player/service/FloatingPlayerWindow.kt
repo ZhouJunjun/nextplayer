@@ -7,6 +7,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
@@ -18,11 +19,19 @@ import android.view.SurfaceView
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
+import android.view.accessibility.CaptioningManager
 import android.widget.FrameLayout
 import android.widget.ImageButton
+import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import androidx.media3.common.text.CueGroup
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.CaptionStyleCompat
+import androidx.media3.ui.SubtitleView
+import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
+import dev.anilbeesetti.nextplayer.feature.player.extensions.toTypeface
 import dev.anilbeesetti.nextplayer.core.ui.R as coreUiR
 import kotlin.math.abs
 
@@ -55,6 +64,11 @@ private const val PROGRESS_BOTTOM_MARGIN_DP = 4
 private const val TRACK_COLOR = 0x66FFFFFF
 private val SURFACE_ATTACH_RETRY_DELAYS_MS = longArrayOf(120, 360, 900)
 private const val DEFAULT_ASPECT_RATIO = 16f / 9f
+/** A video wider than this gets the crop button and is shown cropped to this ratio by default. */
+private const val CROP_TARGET_ASPECT_RATIO = 16f / 9f
+/** How small and how large the subtitles may get relative to the window height. */
+private const val MIN_TEXT_SIZE_FRACTION = 0.03f
+private const val MAX_TEXT_SIZE_FRACTION = 0.12f
 
 /** Where the last window position is kept, so the next window opens in the same place. */
 private const val POSITION_PREFERENCES = "floating_player_window"
@@ -86,10 +100,16 @@ internal fun Context.requestHideFloatingWindow() {
  *
  * The controls follow the usual miniature player layout: full screen in the top start corner, close
  * in the top end corner, a large play/pause in the middle and a seek bar along the bottom edge. The
- * bar and the buttons are one set: they appear and disappear together. The size of the window is
- * picked by the orientation of the video: a landscape or square video is as wide as the screen minus
- * a small margin, a portrait video is half of the screen tall, and the other dimension always follows
- * the aspect ratio, so the video fills the window edge to edge and the border sits on its edge.
+ * bar and the buttons are one set: they appear and disappear together. Subtitles are drawn by a
+ * subtitle view over the video, fed by the cues of the session player, so whatever track was picked
+ * in the full screen player keeps showing here without being selected twice.
+ *
+ * A video wider than 16:9 is cropped to 16:9 by default and gets an extra button in the top start
+ * corner to switch back to its own ratio. The window is rebuilt for whichever ratio is on show, so
+ * the picture always fills it edge to edge. The rest of the sizing is picked by the orientation of
+ * the video: a landscape or square video is as wide as the screen minus a small margin, a portrait
+ * video is half of the screen tall, and the other dimension always follows the aspect ratio, so the
+ * border sits on the edge of the video.
  *
  *
  * The window starts where it was left last time: the last position is stored when a drag finishes,
@@ -103,6 +123,7 @@ internal fun Context.requestHideFloatingWindow() {
 internal class FloatingPlayerWindow(
     private val context: Context,
     private val player: Player,
+    private val preferences: PlayerPreferences,
     private val onClose: () -> Unit,
     private val onOpenFullScreen: () -> Unit,
 ) {
@@ -116,10 +137,18 @@ internal class FloatingPlayerWindow(
 
     private var rootView: FrameLayout? = null
     private var videoView: SurfaceView? = null
+    private var subtitleView: SubtitleView? = null
     private var controlsView: View? = null
     private var playPauseButton: ImageButton? = null
     private var progressView: SeekProgressView? = null
+    private var cropButton: ImageButton? = null
     private var layoutParams: WindowManager.LayoutParams? = null
+
+    /** False when the video plays at its own ratio, true when it is cropped to 16:9. */
+    private var isCropped: Boolean = false
+
+    /** The ratio the default crop state was picked for, so a new video starts from the default. */
+    private var videoAspectForCrop: Float = DEFAULT_ASPECT_RATIO
 
     /** Current window offsets, in the [Gravity.BOTTOM] or [Gravity.CENTER_HORIZONTAL] frame. */
     private var windowX = 0
@@ -145,7 +174,23 @@ internal class FloatingPlayerWindow(
 
     private val playerListener = object : Player.Listener {
         override fun onVideoSizeChanged(videoSize: VideoSize) {
+            val aspect = aspectRatio(
+                videoWidth = videoSize.width,
+                videoHeight = videoSize.height,
+            )
+            // A different video starts out in the default state: cropped when it is wider than
+            // 16:9. While the same video keeps playing, whatever the user picked stays.
+            if (abs(aspect - videoAspectForCrop) > 0.001f) {
+                videoAspectForCrop = aspect
+                isCropped = supportsCrop(aspect = aspect)
+            }
+            updateCropButton()
+            applyVideoScalingMode()
             resizeWindow(videoWidth = videoSize.width, videoHeight = videoSize.height)
+        }
+
+        override fun onCues(cueGroup: CueGroup) {
+            subtitleView?.setCues(cueGroup.cues)
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -171,6 +216,10 @@ internal class FloatingPlayerWindow(
         if (isShowing || rootView != null) return
 
         restoreWindowPosition()
+        val videoAspect = aspectRatio()
+        videoAspectForCrop = videoAspect
+        // A video wider than 16:9 opens cropped, everything else plays at its own ratio.
+        isCropped = supportsCrop(aspect = videoAspect)
         val params = createLayoutParams(
             videoWidth = player.videoSize.width,
             videoHeight = player.videoSize.height,
@@ -183,8 +232,12 @@ internal class FloatingPlayerWindow(
         isShowing = true
         player.addListener(playerListener)
         updatePlayPauseIcon(isPlaying = player.isPlaying)
+        updateCropButton()
         updateProgress()
         applyKeepScreenOn(keepScreenOn = player.isPlaying)
+        applyVideoScalingMode()
+        // Subtitles are already selected in the full screen player, they just need to be drawn here.
+        subtitleView?.setCues(player.currentCues?.cues.orEmpty())
         attachSurface()
         // The player activity clears the surface while it is torn down, so re-attach a few times.
         for (delay in SURFACE_ATTACH_RETRY_DELAYS_MS) {
@@ -201,14 +254,18 @@ internal class FloatingPlayerWindow(
         persistWindowPosition()
         handler.removeCallbacksAndMessages(null)
         player.removeListener(playerListener)
+        // The full screen player can be narrower than the crop, so the video goes back uncropped.
+        setVideoScalingMode(cropped = false)
         // The surface is left alone on purpose: whoever hides this window either already owns the
         // surface (the full screen player) or stops the whole session right after.
         rootView?.let { view -> runCatching { windowManager.removeView(view) } }
         rootView = null
         videoView = null
+        subtitleView = null
         controlsView = null
         playPauseButton = null
         progressView = null
+        cropButton = null
         layoutParams = null
     }
 
@@ -251,6 +308,31 @@ internal class FloatingPlayerWindow(
             ),
         )
 
+        // Subtitles sit right above the video and are driven by the same cues the player emits, so
+        // whatever track is selected in the full screen player shows up here unchanged. The view
+        // stops above the seek bar, which keeps the text from landing on top of it.
+        val subtitles = SubtitleView(context).apply {
+            setStyle(createCaptionStyle())
+            setApplyEmbeddedStyles(preferences.applyEmbeddedStyles)
+            // The window is much smaller than the screen, so the text is sized as a fraction of the
+            // window instead of the absolute size that was picked for the full screen player.
+            setFractionalTextSize(subtitleTextSizeFraction())
+            // The subtitles sit over the whole video, so the touches have to reach the window and
+            // keep dragging it instead of being eaten by this layer.
+            isClickable = false
+            isFocusable = false
+        }
+        root.addView(
+            subtitles,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ).apply {
+                bottomMargin = ((PROGRESS_BOTTOM_MARGIN_DP + PROGRESS_TOUCH_HEIGHT_DP) * density)
+                    .toInt()
+            },
+        )
+
         val controls = buildControlsView()
         root.addView(
             controls,
@@ -272,8 +354,45 @@ internal class FloatingPlayerWindow(
         )
 
         videoView = video
+        subtitleView = subtitles
         controlsView = controls
         return root
+    }
+
+    /**
+     * Mirrors the caption style of the full screen player, so the subtitles look the same in both.
+     * The window keeps the fractional sizing of the subtitle view, which rescales the text to the
+     * window instead of using the absolute size picked for the full screen player.
+     */
+    private fun createCaptionStyle(): CaptionStyleCompat {
+        val captioningManager = context.getSystemService(CaptioningManager::class.java)
+        if (preferences.useSystemCaptionStyle && captioningManager != null) {
+            return CaptionStyleCompat.createFromCaptionStyle(captioningManager.userStyle)
+        }
+        return CaptionStyleCompat(
+            Color.WHITE,
+            Color.BLACK.takeIf { preferences.subtitleBackground } ?: Color.TRANSPARENT,
+            Color.TRANSPARENT,
+            CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW,
+            Color.BLACK,
+            Typeface.create(
+                preferences.subtitleFont.toTypeface(),
+                Typeface.BOLD.takeIf { preferences.subtitleTextBold } ?: Typeface.NORMAL,
+            ),
+        )
+    }
+
+    /**
+     * The subtitle view sizes its text as a fraction of its own height, so the text shrinks with
+     * the window instead of keeping the absolute size that was picked for the full screen player.
+     * The user setting is applied as a multiplier over the default fraction, which keeps a larger
+     * setting visibly larger here too.
+     */
+    private fun subtitleTextSizeFraction(): Float {
+        val relativeSize = preferences.subtitleTextSize.toFloat() /
+            PlayerPreferences.DEFAULT_SUBTITLE_TEXT_SIZE
+        return (SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * relativeSize)
+            .coerceIn(MIN_TEXT_SIZE_FRACTION, MAX_TEXT_SIZE_FRACTION)
     }
 
     private fun buildBorderView(): View = View(context).apply {
@@ -311,7 +430,7 @@ internal class FloatingPlayerWindow(
                 if (isDragging) {
                     // A landscape video already spans the screen width, so it snaps back to the
                     // horizontal center (5dp on each side) and the drag becomes a vertical move.
-                    windowX = if (isLandscapeVideo()) {
+                    windowX = if (isLandscapeWindow()) {
                         0
                     } else {
                         clampX(
@@ -381,6 +500,12 @@ internal class FloatingPlayerWindow(
             paddingDp = TOP_BUTTON_PADDING_DP,
             onClick = { onOpenFullScreen() },
         )
+        cropButton = createButton(
+            iconRes = coreUiR.drawable.ic_crop_landscape,
+            sizeDp = TOP_BUTTON_SIZE_DP,
+            paddingDp = TOP_BUTTON_PADDING_DP,
+            onClick = { toggleCrop() },
+        )
         val closeButton = createButton(
             iconRes = coreUiR.drawable.ic_close,
             sizeDp = TOP_BUTTON_SIZE_DP,
@@ -405,6 +530,19 @@ internal class FloatingPlayerWindow(
                 Gravity.TOP or Gravity.START,
             ).apply {
                 marginStart = margin
+                topMargin = margin
+            },
+        )
+        // Sits right next to the full screen button, still in the top start corner. It is hidden
+        // unless the video is wider than 16:9, which is the only case where cropping applies.
+        container.addView(
+            cropButton,
+            FrameLayout.LayoutParams(
+                (TOP_BUTTON_SIZE_DP * density).toInt(),
+                (TOP_BUTTON_SIZE_DP * density).toInt(),
+                Gravity.TOP or Gravity.START,
+            ).apply {
+                marginStart = margin + (TOP_BUTTON_SIZE_DP * density).toInt()
                 topMargin = margin
             },
         )
@@ -443,6 +581,53 @@ internal class FloatingPlayerWindow(
         // The player listener refreshes the icon and the controls visibility once the state settles.
         if (player.isPlaying) player.pause() else player.play()
         updateProgress()
+    }
+
+    /**
+     * Switches between the original ratio of the video and 16:9. The window is rebuilt for the new
+     * ratio at the same time: with cropping on, the video is cut at the sides and the window takes
+     * the 16:9 shape it now shows, so the picture still fills the window edge to edge.
+     */
+    private fun toggleCrop() {
+        if (!supportsCrop(aspect = aspectRatio())) return
+        isCropped = !isCropped
+        applyVideoScalingMode()
+        updateCropButton()
+        resizeWindow(
+            videoWidth = player.videoSize.width,
+            videoHeight = player.videoSize.height,
+        )
+        showControls()
+        handler.removeCallbacks(hideControlsRunnable)
+        handler.postDelayed(hideControlsRunnable, CONTROLS_AUTO_HIDE_DELAY_MS)
+    }
+
+    /**
+     * Cropping is done by the video renderer, not by the window: with the scaling mode set to crop,
+     * the video is scaled until it fills the surface and the parts that do not fit are cut off on
+     * both sides, which turns a wider than 16:9 video into a 16:9 picture.
+     */
+    private fun applyVideoScalingMode() {
+        setVideoScalingMode(cropped = isCropped && supportsCrop(aspect = aspectRatio()))
+    }
+
+    private fun setVideoScalingMode(cropped: Boolean) {
+        val exoPlayer = player as? ExoPlayer ?: return
+        val mode = if (cropped) {
+            C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+        } else {
+            C.VIDEO_SCALING_MODE_SCALE_TO_FIT
+        }
+        runCatching { exoPlayer.setVideoScalingMode(mode) }
+    }
+
+    /** The crop button only makes sense for a video that is wider than the 16:9 target. */
+    private fun supportsCrop(aspect: Float): Boolean =
+        aspect > CROP_TARGET_ASPECT_RATIO + 0.01f
+
+    private fun updateCropButton() {
+        cropButton?.visibility =
+            if (supportsCrop(aspect = aspectRatio())) View.VISIBLE else View.GONE
     }
 
     private fun updatePlayPauseIcon(isPlaying: Boolean) {
@@ -490,13 +675,30 @@ internal class FloatingPlayerWindow(
         runCatching { windowManager.updateViewLayout(root, params) }
     }
 
+    /**
+     * The ratio the window is built for: the original ratio of the video, or 16:9 while a video
+     * wider than that is being shown cropped.
+     */
+    private fun layoutAspectRatio(
+        videoWidth: Int = player.videoSize.width,
+        videoHeight: Int = player.videoSize.height,
+    ): Float {
+        val aspect = aspectRatio(videoWidth = videoWidth, videoHeight = videoHeight)
+        return if (isCropped && supportsCrop(aspect = aspect)) {
+            CROP_TARGET_ASPECT_RATIO
+        } else {
+            aspect
+        }
+    }
+
     private fun createLayoutParams(
         videoWidth: Int,
         videoHeight: Int,
     ): WindowManager.LayoutParams {
         val screenWidth = screenSize().first
         val screenHeight = screenSize().second
-        val aspect = aspectRatio(videoWidth = videoWidth, videoHeight = videoHeight)
+        // A video wider than 16:9 shrinks to the 16:9 target while it is shown cropped.
+        val aspect = layoutAspectRatio(videoWidth = videoWidth, videoHeight = videoHeight)
         // The widest window the screen allows, and the tallest a window is allowed to get.
         val maxWidth = (screenWidth - WINDOW_HORIZONTAL_MARGIN_DP * density)
             .toInt()
@@ -541,7 +743,7 @@ internal class FloatingPlayerWindow(
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            x = if (isLandscapeVideo()) 0 else clampX(value = windowX, windowWidth = width)
+            x = if (isLandscapeWindow()) 0 else clampX(value = windowX, windowWidth = width)
             y = clampY(value = windowY, windowHeight = height)
             if (player.isPlaying) flags = flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         }
@@ -592,8 +794,12 @@ internal class FloatingPlayerWindow(
         DEFAULT_ASPECT_RATIO
     }
 
-    /** A landscape (or square) video takes the whole window width, so it cannot slide sideways. */
-    private fun isLandscapeVideo(): Boolean = aspectRatio() >= 1f
+    /**
+     * A landscape (or square) window already spans the available width, so it cannot slide
+     * sideways. This follows the window ratio, not the video ratio: a wide video shown uncropped is
+     * full width too, while the same video cropped to 16:9 is a little shorter.
+     */
+    private fun isLandscapeWindow(): Boolean = layoutAspectRatio() >= 1f
 
     private fun screenSize(): Pair<Int, Int> {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

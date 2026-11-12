@@ -913,6 +913,7 @@ class PlayerService : MediaSessionService() {
         floatingWindow = FloatingPlayerWindow(
             context = this,
             player = player,
+            preferences = playerPreferences,
             onClose = {
                 hideFloatingWindow()
                 serviceScope.launch { savePositionAndStopSession() }
