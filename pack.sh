@@ -11,6 +11,10 @@
 #   BUILD_USER=other sh pack.sh      # 业务用户名不是 itdev 时
 #   CPU_LIMIT=2 MEM_LIMIT_MB=2048 sh pack.sh   # 临时再压低编译用的资源
 #   KOTLIN_STRATEGY=daemon sh pack.sh          # Kotlin 编译改回独立守护进程（默认 in-process）
+#   LINT=on sh pack.sh                         # 保留 lintVital 检查（默认跳过）
+#
+# 每次运行的结论都会写进 .build-cache/last-run.status（含退出码、被哪个信号中断、
+# 最后跑到的任务），终端断线也能在下次启动时看到；本次构建进程 pid 记在 build.pid。
 #
 # 资源上限（默认）：
 #   内存 4G —— 单个 JVM：Gradle 堆 2.5G + 元空间 0.375G，Kotlin 编译跑在这个堆里
@@ -72,6 +76,11 @@ MIRROR="${MIRROR:-on}"
 # 只剩一个 JVM。要退回老办法：KOTLIN_STRATEGY=daemon sh pack.sh
 KOTLIN_STRATEGY="${KOTLIN_STRATEGY:-in-process}"
 
+# lint：assembleRelease 默认会挂 lintVitalRelease，要在 Gradle 进程里把整个模块的
+# UAST 过一遍，是这个 4G 预算里最重的一步，而且它只做检查、不改产物。
+# 默认跳过；要照原样跑 lint 就 LINT=on sh pack.sh
+LINT="${LINT:-skip}"
+
 # 4G 预算（cgroup 算 RSS，比堆大：还有元空间、代码缓存、线程栈、直接内存）：
 # in-process 只有一份 JVM —— Gradle 堆 2.5G + 元空间 0.375G，其余约 1G 留给 JVM 开销。
 GRADLE_HEAP_MB=$((MEM_LIMIT_MB * 5 / 8))
@@ -107,6 +116,11 @@ GRADLE_TMP_DIR="$CACHE_ROOT/tmp"               # Gradle 与子进程的临时文
 # 依赖仓库前置国内镜像的 init 脚本（不改 settings.gradle.kts）
 MIRROR_INIT="$PROJECT_DIR/gradle/domestic-mirrors.init.gradle"
 
+# 每次运行的结论强制落在文件里。终端断线、日志被截断、管道被 SIGPIPE 打断时，
+# 屏幕上什么都留不下，只有这个文件能说明上一次到底是怎么结束的（含退出码）。
+STATE_FILE="$CACHE_ROOT/last-run.status"
+LAST_TASK_FILE="$CACHE_ROOT/last-task"
+
 # ============================================================ 输出
 
 if [ -t 1 ]; then
@@ -116,11 +130,78 @@ else
     C_R=''; C_G=''; C_Y=''; C_B=''; C_BOLD=''; C_0=''
 fi
 
-step() { printf '\n%s==> %s%s\n' "$C_B$C_BOLD" "$*" "$C_0"; }
+step() { RUN_STAGE="$*"; printf '\n%s==> %s%s\n' "$C_B$C_BOLD" "$*" "$C_0"; }
 ok()   { printf '  %s[ ok ]%s %s\n' "$C_G" "$C_0" "$*"; }
 warn() { printf '  %s[warn]%s %s\n' "$C_Y" "$C_0" "$*"; }
 die()  { printf '\n%s[FAIL]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 say()  { printf '  %s\n' "$*"; }
+
+# 进度行往哪写：终端直连就写屏幕；被 `| tee` 或 `> file` 接管时写 /dev/tty，
+# 这样屏幕上仍有心跳，日志文件里不掺这些行；两者都没有就丢弃。
+progress_out() {
+    if [ -t 1 ]; then
+        cat
+    elif { : >/dev/tty; } 2>/dev/null; then
+        cat >/dev/tty 2>/dev/null || true
+    else
+        cat >/dev/null
+    fi
+}
+
+# ============================================================ 运行状态落盘
+
+RUN_START_EPOCH=0
+RUN_STAGE="启动"
+
+# 退出时无条件写结论。信号中断时 EXIT 也会跟着触发，所以这里能覆盖所有路径。
+record_exit() {
+    local rc="${1:-$?}"
+    local dur=$(( $(date +%s) - RUN_START_EPOCH ))
+    mkdir -p "$CACHE_ROOT" 2>/dev/null || true
+    {
+        printf 'time=%s\n' "$(date '+%F %T')"
+        printf 'result=%s\n' "$RUN_STAGE"
+        printf 'exit=%s\n' "$rc"
+        printf 'seconds=%s\n' "$dur"
+        printf 'last_task=%s\n' "$(cat "$LAST_TASK_FILE" 2>/dev/null || echo '-')"
+        printf 'log=%s\n' "$CACHE_ROOT/gradle-build.log"
+    } >"$STATE_FILE.tmp" 2>/dev/null && mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null
+    return 0
+}
+
+# 被 INT/TERM/HUP 打断时先把状态写清楚再走，否则屏幕上只剩一段被截断的日志。
+on_signal() {
+    local sig="$1" code
+    case "$sig" in
+        INT) code=130 ;;
+        HUP) code=129 ;;
+        *)   code=143 ;;
+    esac
+    RUN_STAGE="被信号 $sig 中断"
+    trap - EXIT
+    printf '\n%s[中断]%s 收到 %s：构建进程已终止，结论见 %s\n' \
+        "$C_R" "$C_0" "$sig" "$STATE_FILE" >&2
+    record_exit "$code"
+    exit "$code"
+}
+
+# 上一次运行是什么结果：终端断线那次，屏幕上什么都没有，只能靠这个看
+show_last_run() {
+    [ -f "$STATE_FILE" ] || return 0
+    local result exit_code when seconds last_task
+    result="$(sed -n 's/^result=//p' "$STATE_FILE")"
+    exit_code="$(sed -n 's/^exit=//p' "$STATE_FILE")"
+    when="$(sed -n 's/^time=//p' "$STATE_FILE")"
+    seconds="$(sed -n 's/^seconds=//p' "$STATE_FILE")"
+    last_task="$(sed -n 's/^last_task=//p' "$STATE_FILE")"
+    [ -n "$exit_code" ] || return 0
+    case "${seconds:-0}" in ''|*[!0-9]*) seconds=0 ;; esac
+    case "$exit_code" in ''|*[!0-9]*) exit_code='?' ;; esac
+    say "上次运行：${when}  结果 ${result:-?}  退出码 ${exit_code}  耗时 $(( seconds / 60 ))m$(( seconds % 60 ))s"
+    if [ -n "$last_task" ] && [ "$last_task" != "-" ]; then
+        say "          最后任务：$last_task"
+    fi
+}
 
 # ============================================================ 身份闸门
 
@@ -406,42 +487,48 @@ gradle_with_progress() {
         )
     fi
 
+    # lintVital 只在 release 包里做 fatal 检查，不改产物，却要吃一大口堆；
+    # 4G 预算下先跳过，需要时 LINT=on sh pack.sh 恢复
+    local lint_args=()
+    if [ "$LINT" = "skip" ]; then
+        lint_args=(
+            -x lintVitalAnalyzeRelease
+            -x lintVitalReportRelease
+            -x lintVitalRelease
+        )
+    fi
+
     "${LIMITER[@]}" "${TASKSET[@]}" "$GRADLE_HOME/bin/gradle" assembleRelease \
         --console=plain --no-daemon \
         "--max-workers=$WORKERS" \
         "${mirror_args[@]}" \
         "${kotlin_args[@]}" \
+        "${lint_args[@]}" \
         "-Dorg.gradle.jvmargs=-Xmx${GRADLE_HEAP_MB}m -XX:MaxMetaspaceSize=${GRADLE_META_MB}m -Dfile.encoding=UTF-8" \
         >>"$log" 2>&1 &
     pid=$!
-
-    # 输出被重定向（CI 或 `> file`）时不刷心跳，避免污染日志
-    if [ ! -t 1 ]; then
-        set +e
-        wait "$pid"; rc=$?
-        set -e
-        cat "$log"
-        return "$rc"
-    fi
+    # 记下 pid：上次的 toolchain 下载锁就是被残留的旧构建进程占着，方便下次 kill
+    printf '%s\n' "$pid" >"$CACHE_ROOT/build.pid" 2>/dev/null || true
 
     local printed=0 now elapsed total label last_task_line="" last_report="$start"
     # 心跳不能只说"进程还活着"：还要能看出是卡在下载，还是已经报错了。
-    local log_size=0 last_grow="$start" silent=0 cache_mb=0
+    local log_size=0 last_grow="$start" silent=0
     local err_printed=0 stuck_hinted=0
 
     while kill -0 "$pid" 2>/dev/null; do
         sleep 2
         kill -0 "$pid" 2>/dev/null || break
 
-        # 把新出现的任务行刷到终端
+        # 把新出现的任务行刷到屏幕（`| tee` 时走 /dev/tty，不污染日志文件）
         total="$(grep -c '^> Task ' "$log" 2>/dev/null || true)"
         [ -z "$total" ] && total=0
         if [ "$total" -gt "$printed" ]; then
             grep '^> Task ' "$log" | tail -n "$((total - printed))" |
-                sed 's/^> Task /     · /'
+                sed 's/^> Task /     · /' | progress_out
             printed="$total"
-            # 记下最后一个任务名，心跳时一起显示
+            # 记下最后一个任务名，心跳和状态文件都用它
             last_task_line="$(grep '^> Task ' "$log" | tail -1 | sed 's/^> Task //')"
+            printf '%s\n' "$last_task_line" >"$LAST_TASK_FILE" 2>/dev/null || true
         fi
 
         now="$(date +%s)"
@@ -469,17 +556,21 @@ gradle_with_progress() {
         # 每 30 秒打一行心跳，说明没卡死（不管有没有新任务都打）
         if [ "$((now - last_report))" -ge 30 ]; then
             elapsed="$((now - start))"
-            cache_mb="$(du -sm "$GRADLE_USER_HOME_DIR" 2>/dev/null | cut -f1)"
-            [ -z "$cache_mb" ] && cache_mb=0
-            printf '   %s⏳ 已运行 %dm%02ds%s' \
-                "$C_Y" "$((elapsed / 60))" "$((elapsed % 60))" "$C_0"
-            if [ -n "$last_task_line" ]; then
-                label="$(friendly_task "$last_task_line")"
-                printf '   当前：%s' "$label"
-            else
-                printf '   正在配置项目 / 下载依赖'
-            fi
-            printf '   依赖缓存 %sM   日志静默 %ss\n' "$cache_mb" "$silent"
+            # java 进程占的物理内存：贴着 4G 上限时能提前看出要被 OOM 杀掉
+            local rss_mb
+            rss_mb="$(ps -o rss= -C java 2>/dev/null | awk '{s+=$1} END {printf "%d", s/1024}' || true)"
+            [ -z "$rss_mb" ] && rss_mb=0
+            {
+                printf '   %s⏳ 已运行 %dm%02ds%s' \
+                    "$C_Y" "$((elapsed / 60))" "$((elapsed % 60))" "$C_0"
+                if [ -n "$last_task_line" ]; then
+                    printf '   当前：%s' "$(friendly_task "$last_task_line")"
+                else
+                    printf '   正在配置项目 / 下载依赖'
+                fi
+                printf '   内存 %sM/%sM   日志静默 %ss\n' \
+                    "$rss_mb" "$MEM_LIMIT_MB" "$silent"
+            } | progress_out
 
             # 3 分钟没有任何输出：多半是卡在下载，给出可操作的提示（只提示一次）
             if [ "$silent" -ge 180 ] && [ "$stuck_hinted" = 0 ]; then
@@ -499,7 +590,12 @@ gradle_with_progress() {
     [ -z "$total" ] && total=0
     if [ "$total" -gt "$printed" ]; then
         grep '^> Task ' "$log" | tail -n "$((total - printed))" |
-            sed 's/^> Task /     · /'
+            sed 's/^> Task /     · /' | progress_out
+    fi
+
+    # 输出被 `| tee` / `> file` 接管时，把完整 Gradle 日志一次性补齐到日志文件里
+    if [ ! -t 1 ]; then
+        cat "$log"
     fi
 
     elapsed="$(( $(date +%s) - start ))"
@@ -542,6 +638,12 @@ build_apk() {
         warn "依赖镜像：已按 MIRROR=off 关闭，直连 google / mavenCentral（国内很慢）"
     else
         warn "依赖镜像：找不到 $MIRROR_INIT，直连 google / mavenCentral（国内很慢）"
+    fi
+
+    if [ "$LINT" = "skip" ]; then
+        ok "lint：跳过 lintVital（只做检查不改产物，4G 预算下最吃内存的一步）；LINT=on 可恢复"
+    else
+        warn "lint：保留 lintVital 检查，内存峰值会明显升高"
     fi
 
     say "开始编译，下面会实时显示 Gradle 任务；长时间无任务输出时会打心跳"
@@ -653,20 +755,33 @@ sign_apk() {
 # ============================================================ main
 
 main() {
+    RUN_START_EPOCH="$(date +%s)"
+    RUN_STAGE="启动"
+    trap record_exit EXIT
+    trap 'on_signal INT' INT
+    trap 'on_signal TERM' TERM
+    trap 'on_signal HUP' HUP
+
     printf '\n%snextplayer 编译打包%s\n' "$C_BOLD" "$C_0"
     printf '项目目录：%s\n' "$PROJECT_DIR"
     printf '安装前缀：%s\n' "$PREFIX"
+    show_last_run
 
     # 身份闸门放最前面，不合格立刻退出
     step "检查运行身份"
     require_build_user
 
+    RUN_STAGE="检查环境"
     check_host
     check_toolchain
     check_project_writable
+    RUN_STAGE="准备项目配置"
     prepare_project
+    RUN_STAGE="编译 release"
     build_apk
+    RUN_STAGE="签名"
     sign_apk
+    RUN_STAGE="成功"
 
     printf '%s完成%s\n\n' "$C_G$C_BOLD" "$C_0"
 }
