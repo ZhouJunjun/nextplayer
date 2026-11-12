@@ -12,6 +12,8 @@
 #   CPU_LIMIT=2 MEM_LIMIT_MB=2048 sh pack.sh   # 临时再压低编译用的资源
 #   KOTLIN_STRATEGY=daemon sh pack.sh          # Kotlin 编译改回独立守护进程（默认 in-process）
 #   LINT=on sh pack.sh                         # 保留 lintVital 检查（默认跳过）
+#   sh pack.sh --sign-only                     # 跳过编译，只给已有的未签名 APK 签名
+#                                              # （编译已经成功、只剩签名失败时用，几秒出结果）
 #
 # 每次运行的结论都会写进 .build-cache/last-run.status（含退出码、被哪个信号中断、
 # 最后跑到的任务），终端断线也能在下次启动时看到；本次构建进程 pid 记在 build.pid。
@@ -52,9 +54,13 @@ JDK_DIR_NAME="jdk-17.0.21"
 GRADLE_VER="9.9.0"
 PLATFORM_ID="android-37.0"      # compileSdk = 37
 BUILD_TOOLS_VER="37.0.0"        # 脚本签名用这个版本
+
 # 构建需要的 build-tools：AGP 9.5.1 默认用 36.0.0（项目没声明 buildToolsVersion），
 # 所以 36.0.0 必须存在，否则 Gradle 会去下载并因许可证失败
 REQUIRED_BUILD_TOOLS=("37.0.0" "36.0.0")
+
+# 脚本自身版本：跑出来的日志里带这一行，一眼能看出用的是新脚本还是旧脚本
+SCRIPT_VER="2026-11-12-r4"
 
 # 签名
 KS_PASS="000777"
@@ -744,13 +750,28 @@ sign_apk() {
     local bt="$SDK_HOME/build-tools/$BUILD_TOOLS_VER"
     local apksigner="$bt/apksigner"
     local aapt2="$bt/aapt2"
-    [ -x "$apksigner" ] || die "找不到 apksigner：$apksigner"
+
+    say "build-tools：$bt"
+    say "apksigner  ：$apksigner"
+    [ -x "$apksigner" ] ||
+        die "找不到可执行的 apksigner：$apksigner
+  $bt 目录不完整，或 apksigner 没有可执行权限。排查：ls -l $bt"
 
     # apksigner 是 shell 脚本，内部靠 PATH 里的 java 启动，只设 JAVA_HOME 不够
     export JAVA_HOME="$JDK_HOME"
     export PATH="$JDK_HOME/bin:$PATH"
-    say "apksigner：$apksigner"
-    say "JAVA     ：$(command -v java || echo '未找到')"
+    say "JAVA_HOME  ：$JAVA_HOME"
+    say "java       ：$(command -v java || echo '未找到')"
+
+    [ -f "$UNSIGNED_APK" ] ||
+        die "找不到未签名产物：$UNSIGNED_APK
+  先完整跑一次构建，或确认 APK_DIR 是否被改动。"
+
+    local size_kb
+    size_kb=$(( $(wc -c <"$UNSIGNED_APK") / 1024 ))
+    say "输入       ：$(basename "$UNSIGNED_APK")（${size_kb}KB）"
+    say "签名库     ：$KEYSTORE"
+    [ -f "$KEYSTORE" ] || die "找不到签名库：$KEYSTORE"
 
     # 版本号从构建脚本里读，不写死在脚本里。
     # 这里不能接 `| head -1`：head 读够就关管道，上游 sed 会吃 SIGPIPE，
@@ -759,13 +780,20 @@ sign_apk() {
     local v
     v="$(sed -n 's/.*versionName *= *"\([^"]*\)".*/\1/p' \
         "$PROJECT_DIR/app/build.gradle.kts" 2>/dev/null | sed -n '1p')"
-    [ -n "$v" ] && version="$v"
+    if [ -n "$v" ]; then version="$v"; fi
 
     local stamp out
     stamp="$(date +%y%m%d_%H%M%S)"
     out="$PROJECT_DIR/nextplayer_${stamp}_appRelease_${version}_arm64.apk"
 
-    say "签名：$(basename "$UNSIGNED_APK") → $(basename "$out")"
+    # 签名这段以前是"打完 ==> 签名 就没下文"的重灾区：apksigner 的输出全被
+    # 吞掉、失败细节一个字看不到。现在把它写进文件，失败就整段回放到屏幕。
+    local sign_log="$CACHE_ROOT/apksigner-sign.log"
+    mkdir -p "$CACHE_ROOT"
+
+    say "输出       ：$out"
+    say "开始签名（apksigner 无输出属正常，最多等几秒）"
+    local rc=0
     "$apksigner" sign \
         --ks "$KEYSTORE" \
         --ks-key-alias "$KS_ALIAS" \
@@ -775,16 +803,36 @@ sign_apk() {
         --v2-signing-enabled true \
         --v3-signing-enabled true \
         --out "$out" \
-        "$UNSIGNED_APK" ||
-        die "apksigner sign 失败（keystore：$KEYSTORE）"
+        "$UNSIGNED_APK" >"$sign_log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '\n%sapksigner 输出：%s\n' "$C_Y" "$C_0" >&2
+        sed -n '1,40p' "$sign_log" >&2 || true
+        die "apksigner sign 失败（退出码 $rc）
+  keystore：$KEYSTORE
+  日志    ：$sign_log"
+    fi
+    ok "签名完成"
+
+    # 产物必须真的落盘，否则后面一路"成功"全是假的
+    if [ ! -s "$out" ]; then
+        die "apksigner 报告成功但产物为空或不存在：$out
+  怀疑目标目录不可写（$PROJECT_DIR）或磁盘满。"
+    fi
+    ok "产物已生成（$(( $(wc -c <"$out") / 1024 ))KB）"
 
     # apksigner 会顺带写 .idsig，不留
     rm -f "$out.idsig"
 
     say "校验签名"
     # 同上：用 sed 读完全部输出再取前 3 行，不给 apksigner 制造 SIGPIPE
-    "$apksigner" verify --print-certs "$out" 2>&1 | sed -n '1,3p' ||
-        die "apksigner verify 失败：$out"
+    local verify_log="$CACHE_ROOT/apksigner-verify.log"
+    rc=0
+    "$apksigner" verify --print-certs "$out" >"$verify_log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        sed -n '1,40p' "$verify_log" >&2 || true
+        die "apksigner verify 失败（退出码 $rc）：$out"
+    fi
+    sed -n '1,3p' "$verify_log" | sed 's/^/  /'
 
     if [ -x "$aapt2" ]; then
         say "APK 信息"
@@ -797,6 +845,24 @@ sign_apk() {
 
 # ============================================================ main
 
+# 只签名：编译已经成功、卡在签名环节时用。跳过整轮构建，几秒出结果。
+SIGN_ONLY=0
+
+usage() {
+    sed -n '7,16p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+parse_args() {
+    local arg
+    for arg in ${1+"$@"}; do
+        case "$arg" in
+            -s|--sign-only) SIGN_ONLY=1 ;;
+            -h|--help)      usage; exit 0 ;;
+            *)              die "未知参数：$arg（-h 看用法）" ;;
+        esac
+    done
+}
+
 main() {
     RUN_START_EPOCH="$(date +%s)"
     RUN_STAGE="启动"
@@ -806,9 +872,11 @@ main() {
     trap 'on_signal HUP' HUP
 
     printf '\n%snextplayer 编译打包%s\n' "$C_BOLD" "$C_0"
+    printf '脚本版本：%s\n' "$SCRIPT_VER"
     printf '项目目录：%s\n' "$PROJECT_DIR"
     printf '安装前缀：%s\n' "$PREFIX"
     show_last_run
+    parse_args "$@"
 
     # 身份闸门放最前面，不合格立刻退出
     step "检查运行身份"
@@ -820,6 +888,16 @@ main() {
     check_project_writable
     RUN_STAGE="准备项目配置"
     prepare_project
+
+    if [ "$SIGN_ONLY" = "1" ]; then
+        say "只签名模式：跳过编译，直接用现有未签名产物"
+        RUN_STAGE="签名"
+        sign_apk
+        RUN_STAGE="成功"
+        printf '%s完成（仅签名）%s\n\n' "$C_G$C_BOLD" "$C_0"
+        return 0
+    fi
+
     RUN_STAGE="编译 release"
     build_apk
     RUN_STAGE="签名"
