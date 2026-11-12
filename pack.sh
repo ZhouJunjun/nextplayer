@@ -9,6 +9,12 @@
 #   bash pack.sh
 #   PREFIX=/opt/tools sh pack.sh     # init_env.sh 装到了自定义前缀时
 #   BUILD_USER=other sh pack.sh      # 业务用户名不是 itdev 时
+#   CPU_LIMIT=2 MEM_LIMIT_MB=2048 sh pack.sh   # 临时再压低编译用的资源
+#
+# 资源上限（默认）：
+#   内存 4G —— 拆成 Gradle 堆 2.25G + 元空间 0.375G、Kotlin 守护进程 0.625G + 0.25G，
+#              其余留给 JIT 与原生工具；能拿到 systemd user manager 时再加 cgroup MemoryMax 硬限
+#   CPU  4 核 —— 机器共 8 核，构建只绑 0-3，另外 4 核留给别的服务；同时 Gradle 并发数 = 4
 #
 # 做什么：
 #   1. 检查 JDK / Gradle / Android SDK 是否已在 $PREFIX 就位，缺了就提示去跑 init_env.sh
@@ -46,6 +52,18 @@ REQUIRED_BUILD_TOOLS=("37.0.0" "36.0.0")
 # 签名
 KS_PASS="000777"
 KS_ALIAS="nextplayer"
+
+# 编译期资源上限（运维要求：内存最多 4G；机器 8 核，构建只许用 4 核，其余留给别的服务）
+# 分两层做：JVM 堆与元空间给死上限（软限），再尽量套一层 cgroup（硬限）。
+MEM_LIMIT_MB="${MEM_LIMIT_MB:-4096}"
+CPU_LIMIT="${CPU_LIMIT:-4}"
+
+# 4G 预算怎么分：Gradle 主进程 2.25G 堆 + 0.375G 元空间，Kotlin 编译守护进程 0.625G 堆
+# + 0.25G 元空间，合计 3.5G，剩下约 0.5G 留给 JIT 代码缓存、线程栈和 AAPT2 这类原生工具。
+GRADLE_HEAP_MB=$((MEM_LIMIT_MB * 9 / 16))
+GRADLE_META_MB=$((MEM_LIMIT_MB * 3 / 32))
+KOTLIN_HEAP_MB=$((MEM_LIMIT_MB * 5 / 32))
+KOTLIN_META_MB=$((MEM_LIMIT_MB / 16))
 
 # ============================================================ 路径
 
@@ -258,6 +276,53 @@ prepare_project() {
 
 # ============================================================ 构建
 
+# 构建命令的前缀。能设 cgroup 就套一层硬上限，设不了就是空数组（软限兜底）。
+LIMITER=()
+TASKSET=()
+
+# 把整个构建进程树罩进 scope 单元，MemoryMax / CPUQuota 由内核执行，
+# 这样即使 Gradle 的堆外开销冲过预算，也不会把机器拖死。
+# 用户会话里拿不到 user manager（没有 XDG_RUNTIME_DIR、会话总线不可用）时跳过。
+setup_limits() {
+    step "设置资源上限"
+
+    local cgroup_ok=0
+    if command -v systemd-run >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] &&
+        systemctl --user show-environment >/dev/null 2>&1; then
+        # 先空跑一次，确认这个账户真的能往自己的 slice 里写限额
+        if systemd-run --user --scope --collect -q \
+            -p "MemoryMax=${MEM_LIMIT_MB}M" \
+            -p "CPUQuota=$((CPU_LIMIT * 100))%" -- true >/dev/null 2>&1; then
+            LIMITER=(
+                systemd-run --user --scope --collect -q
+                -p "MemoryMax=${MEM_LIMIT_MB}M"
+                -p "CPUQuota=$((CPU_LIMIT * 100))%"
+                --
+            )
+            cgroup_ok=1
+        fi
+    fi
+    if [ "$cgroup_ok" = 1 ]; then
+        ok "cgroup 硬上限：MemoryMax=${MEM_LIMIT_MB}M  CPUQuota=$((CPU_LIMIT * 100))%"
+    else
+        warn "拿不到 user manager 的 cgroup，跳过硬限，只靠 JVM 参数（软限）"
+    fi
+
+    local total
+    total="$(nproc 2>/dev/null || echo 0)"
+    if [ "$total" -gt "$CPU_LIMIT" ] && command -v taskset >/dev/null 2>&1; then
+        TASKSET=(taskset -c "0-$((CPU_LIMIT - 1))")
+        ok "CPU 绑核：0-$((CPU_LIMIT - 1))（本机 $total 核，只给构建 $CPU_LIMIT 核）"
+    elif [ "$total" -gt 0 ] && [ "$total" -le "$CPU_LIMIT" ]; then
+        say "本机 $total 核，没超过上限，不绑核"
+    else
+        warn "没有 taskset，只用 Gradle 并发数（$CPU_LIMIT）限制 CPU"
+    fi
+
+    say "内存：Gradle 堆 ${GRADLE_HEAP_MB}M + 元空间 ${GRADLE_META_MB}M，" \
+        "Kotlin 守护进程 ${KOTLIN_HEAP_MB}M + ${KOTLIN_META_MB}M"
+}
+
 # 把 Gradle 的任务名翻译成人话，心跳时显示更有用
 friendly_task() {
     case "$1" in
@@ -295,7 +360,11 @@ gradle_with_progress() {
     local start pid rc
     start="$(date +%s)"
 
-    "$GRADLE_HOME/bin/gradle" assembleRelease --console=plain --no-daemon \
+    "${LIMITER[@]}" "${TASKSET[@]}" "$GRADLE_HOME/bin/gradle" assembleRelease \
+        --console=plain --no-daemon \
+        "--max-workers=$CPU_LIMIT" \
+        "-Dorg.gradle.jvmargs=-Xmx${GRADLE_HEAP_MB}m -XX:MaxMetaspaceSize=${GRADLE_META_MB}m -Dfile.encoding=UTF-8" \
+        "-Dkotlin.daemon.jvm.options=-Xmx${KOTLIN_HEAP_MB}m,-XX:MaxMetaspaceSize=${KOTLIN_META_MB}m" \
         >>"$log" 2>&1 &
     pid=$!
 
@@ -363,6 +432,9 @@ gradle_with_progress() {
 
 build_apk() {
     step "编译 release"
+
+    # 先把内存/CPU 上限定下来，再启动构建进程
+    setup_limits
 
     export JAVA_HOME="$JDK_HOME"
     export ANDROID_HOME="$SDK_HOME"
