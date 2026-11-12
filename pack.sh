@@ -122,14 +122,51 @@ check_host() {
 }
 
 # 工具链由 init_env.sh 装好，这里只检查、不安装
+# 在 $PREFIX 下找可用的 JDK 17。不写死目录名：机器上可能装的是
+# jdk-17.0.15、jdk-17.0.21+9 之类，只要 bin/javac 在、大版本是 17 就用它。
+find_existing_jdk() {
+    local d ver major
+
+    # 候选顺序：约定的目录名优先（多个 JDK 17 并存时行为确定），
+    # 之后才是其他 jdk-17* 目录。注意直接写 jdk-17.0.21 时 java 读不到，
+    # 因为它没有 bin/，会被下面的检查挡掉，所以不用特判。
+    local candidates=(
+        "$PREFIX/$JDK_DIR_NAME"
+        "$PREFIX"/jdk-17*
+        "$PREFIX"/jdk17*
+        "$PREFIX"/*/jdk-17*
+    )
+
+    for d in "${candidates[@]}"; do
+        [ -d "$d" ] || continue
+        # javac 和 java 都要在，缺一个就不是完整 JDK
+        [ -x "$d/bin/javac" ] && [ -x "$d/bin/java" ] || continue
+
+        # 按 java -version 的实际版本判断，不看目录名 —— 目录名可能和真实版本不一致
+        ver="$("$d/bin/java" -version 2>&1 | head -1)"
+        major="$(printf '%s\n' "$ver" | sed -n 's/.*version "\([0-9]*\)[."].*/\1/p')"
+        [ "$major" = "17" ] || continue
+
+        printf '%s' "$d"
+        return 0
+    done
+    return 1
+}
+
 check_toolchain() {
     step "检查工具链"
 
     local missing=0
-    if [ -x "$JDK_HOME/bin/javac" ]; then
+
+    # JDK：先在 $PREFIX 里扫一遍，命中哪个用哪个
+    local found
+    if found="$(find_existing_jdk)"; then
+        JDK_HOME="$found"
         ok "JDK      $JDK_HOME"
+        say "         $("$JDK_HOME/bin/java" -version 2>&1 | head -1)"
     else
-        warn "缺 JDK：$JDK_HOME"; missing=1
+        JDK_HOME="$PREFIX/$JDK_DIR_NAME"
+        warn "缺 JDK 17：$PREFIX 下没找到可用的 jdk-17*"; missing=1
     fi
 
     if [ -x "$GRADLE_HOME/bin/gradle" ]; then
