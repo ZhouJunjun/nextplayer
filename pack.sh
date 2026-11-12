@@ -136,17 +136,10 @@ warn() { printf '  %s[warn]%s %s\n' "$C_Y" "$C_0" "$*"; }
 die()  { printf '\n%s[FAIL]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 say()  { printf '  %s\n' "$*"; }
 
-# 进度行往哪写：终端直连就写屏幕；被 `| tee` 或 `> file` 接管时写 /dev/tty，
-# 这样屏幕上仍有心跳，日志文件里不掺这些行；两者都没有就丢弃。
-progress_out() {
-    if [ -t 1 ]; then
-        cat
-    elif { : >/dev/tty; } 2>/dev/null; then
-        cat >/dev/tty 2>/dev/null || true
-    else
-        cat >/dev/null
-    fi
-}
+# 进度行一律走 stdout。上一版在 `| tee` 时改投 /dev/tty，结果终端有进度、
+# 但 tee 出来的日志里一行心跳都没有 —— 日志一停住就看着像挂了，反而更难判断。
+# 进度行混进日志没有坏处，看不见进度才是致命的。
+progress_out() { cat; }
 
 # ============================================================ 运行状态落盘
 
@@ -164,6 +157,7 @@ record_exit() {
         printf 'exit=%s\n' "$rc"
         printf 'seconds=%s\n' "$dur"
         printf 'last_task=%s\n' "$(cat "$LAST_TASK_FILE" 2>/dev/null || echo '-')"
+        printf 'hs_err=%s\n' "$(ls -t "$PROJECT_DIR"/hs_err_pid*.log "$CACHE_ROOT"/hs_err_pid*.log 2>/dev/null | head -1 || echo '-')"
         printf 'log=%s\n' "$CACHE_ROOT/gradle-build.log"
     } >"$STATE_FILE.tmp" 2>/dev/null && mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null
     return 0
@@ -194,12 +188,17 @@ show_last_run() {
     when="$(sed -n 's/^time=//p' "$STATE_FILE")"
     seconds="$(sed -n 's/^seconds=//p' "$STATE_FILE")"
     last_task="$(sed -n 's/^last_task=//p' "$STATE_FILE")"
+    local hs_err
+    hs_err="$(sed -n 's/^hs_err=//p' "$STATE_FILE")"
     [ -n "$exit_code" ] || return 0
     case "${seconds:-0}" in ''|*[!0-9]*) seconds=0 ;; esac
     case "$exit_code" in ''|*[!0-9]*) exit_code='?' ;; esac
     say "上次运行：${when}  结果 ${result:-?}  退出码 ${exit_code}  耗时 $(( seconds / 60 ))m$(( seconds % 60 ))s"
     if [ -n "$last_task" ] && [ "$last_task" != "-" ]; then
         say "          最后任务：$last_task"
+    fi
+    if [ -n "$hs_err" ] && [ "$hs_err" != "-" ]; then
+        say "          JVM 崩溃报告：$hs_err"
     fi
 }
 
@@ -662,6 +661,16 @@ build_apk() {
         # 失败时把日志尾部捞出来，别让人自己去翻文件
         printf '\n%s---- 构建失败，日志末 30 行 ----%s\n' "$C_R" "$C_0" >&2
         tail -n 30 "$CACHE_ROOT/gradle-build.log" >&2
+
+        # JVM 被 OOM 杀掉 / 自己崩了，会留 hs_err_pid*.log，原因写在头部几行里，
+        # 这种情况 Gradle 日志往往来不及写任何 FAILURE。
+        local hs_err=""
+        hs_err="$(ls -t "$PROJECT_DIR"/hs_err_pid*.log "$CACHE_ROOT"/hs_err_pid*.log 2>/dev/null | head -1 || true)"
+        if [ -n "$hs_err" ]; then
+            printf '\n%s---- JVM 崩溃报告：%s ----%s\n' "$C_R" "$hs_err" "$C_0" >&2
+            head -12 "$hs_err" >&2 || true
+            grep -m3 -E 'OutOfMemoryError|Native memory allocation|insufficient memory|SIG(SEGV|BUS|KILL)' "$hs_err" >&2 || true
+        fi
 
         # 日志被硬切断（没有 BUILD FAILED 也没有编译错误）说明进程是被信号杀掉的，
         # 最常见的是 cgroup MemoryMax 触发 OOM。这种情况 Gradle 来不及写任何错误。
