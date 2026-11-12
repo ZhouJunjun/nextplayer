@@ -1,0 +1,41 @@
+// 国内镜像加速 —— Gradle 初始化脚本
+//
+// 用法（pack.sh 会自动传）：
+//   gradle assembleRelease --init-script gradle/domestic-mirrors.init.gradle
+//
+// 为什么用 init 脚本而不是改 settings.gradle.kts：
+//   工程里的仓库声明保持原样，镜像只在本机/本机构建时前置，代码评审和上游同步都不受影响。
+//
+// 做什么：把 settings 里声明的仓库（pluginManagement + dependencyResolutionManagement）
+//   改写成「国内镜像在前、原仓库在后」。镜像命中就直接用，镜像里没有的构件会落到原仓库兜底，
+//   所以不会出现某个依赖镜像缺版本就编不过的情况。
+//   jitpack 不动：阿里云没有它的代理，保持直连。
+
+def MIRROR_URLS = [
+    'https://maven.aliyun.com/repository/google',        // google() 的镜像（AndroidX / AGP / Compose）
+    'https://maven.aliyun.com/repository/public',        // mavenCentral() + jcenter 的镜像
+    'https://maven.aliyun.com/repository/gradle-plugin', // gradlePluginPortal() 的镜像
+]
+
+def rewrite = { repositories, String tag ->
+    // 原仓库全部留作兜底，顺序不变
+    def originals = repositories.toList()
+
+    repositories.clear()
+    MIRROR_URLS.eachWithIndex { mirrorUrl, index ->
+        repositories.maven { repo ->
+            repo.name = "mirror-${index}-${tag}"
+            repo.url = mirrorUrl
+        }
+    }
+    originals.each { repositories.add(it) }
+
+    if (System.getProperty('mirror.debug') != null) {
+        println "[mirror] ${tag}: " + repositories.toList().collect { it.name + '=' + it.url }.join(', ')
+    }
+}
+
+settingsEvaluated { settings ->
+    rewrite(settings.pluginManagement.repositories, 'plugin')
+    rewrite(settings.dependencyResolutionManagement.repositories, 'deps')
+}

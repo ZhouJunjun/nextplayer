@@ -58,6 +58,10 @@ KS_ALIAS="nextplayer"
 MEM_LIMIT_MB="${MEM_LIMIT_MB:-4096}"
 CPU_LIMIT="${CPU_LIMIT:-4}"
 
+# 国内镜像：把 settings.gradle.kts 里的 google()/mavenCentral()/gradlePluginPortal()
+# 前置成阿里云镜像，镜像里没有的构件仍回落到原仓库。MIRROR=off 可关掉。
+MIRROR="${MIRROR:-on}"
+
 # 4G 预算怎么分：Gradle 主进程 2.25G 堆 + 0.375G 元空间，Kotlin 编译守护进程 0.625G 堆
 # + 0.25G 元空间，合计 3.5G，剩下约 0.5G 留给 JIT 代码缓存、线程栈和 AAPT2 这类原生工具。
 GRADLE_HEAP_MB=$((MEM_LIMIT_MB * 9 / 16))
@@ -81,6 +85,9 @@ UNSIGNED_APK="$APK_DIR/app-arm64-v8a-release-unsigned.apk"
 CACHE_ROOT="$PROJECT_DIR/.build-cache"
 GRADLE_USER_HOME_DIR="$CACHE_ROOT/gradle"      # 依赖、transforms、构建缓存、Kotlin 数据
 GRADLE_TMP_DIR="$CACHE_ROOT/tmp"               # Gradle 与子进程的临时文件
+
+# 依赖仓库前置国内镜像的 init 脚本（不改 settings.gradle.kts）
+MIRROR_INIT="$PROJECT_DIR/gradle/domestic-mirrors.init.gradle"
 
 # ============================================================ 输出
 
@@ -360,9 +367,16 @@ gradle_with_progress() {
     local start pid rc
     start="$(date +%s)"
 
+    # 镜像前置：settings.gradle.kts 里的仓库顺序由 init 脚本改写，工程文件不动
+    local mirror_args=()
+    if [ "$MIRROR" != "off" ] && [ -f "$MIRROR_INIT" ]; then
+        mirror_args=(--init-script "$MIRROR_INIT")
+    fi
+
     "${LIMITER[@]}" "${TASKSET[@]}" "$GRADLE_HOME/bin/gradle" assembleRelease \
         --console=plain --no-daemon \
         "--max-workers=$CPU_LIMIT" \
+        "${mirror_args[@]}" \
         "-Dorg.gradle.jvmargs=-Xmx${GRADLE_HEAP_MB}m -XX:MaxMetaspaceSize=${GRADLE_META_MB}m -Dfile.encoding=UTF-8" \
         "-Dkotlin.daemon.jvm.options=-Xmx${KOTLIN_HEAP_MB}m,-XX:MaxMetaspaceSize=${KOTLIN_META_MB}m" \
         >>"$log" 2>&1 &
@@ -378,6 +392,9 @@ gradle_with_progress() {
     fi
 
     local printed=0 now elapsed total label last_task_line="" last_report="$start"
+    # 心跳不能只说"进程还活着"：还要能看出是卡在下载，还是已经报错了。
+    local log_size=0 last_grow="$start" silent=0 cache_mb=0
+    local err_printed=0 stuck_hinted=0
 
     while kill -0 "$pid" 2>/dev/null; do
         sleep 2
@@ -394,10 +411,33 @@ gradle_with_progress() {
             last_task_line="$(grep '^> Task ' "$log" | tail -1 | sed 's/^> Task //')"
         fi
 
-        # 每 30 秒打一行心跳，说明没卡死（不管有没有新任务都打）
         now="$(date +%s)"
+
+        # 日志不再增长时记静默时长；增长过就归零
+        local cur_size
+        cur_size="$(wc -c <"$log" 2>/dev/null || echo 0)"
+        if [ "$cur_size" -gt "$log_size" ]; then
+            log_size="$cur_size"
+            last_grow="$now"
+            stuck_hinted=0
+        fi
+        silent="$((now - last_grow))"
+
+        # 日志里出现硬错误就立刻亮出来，不必等进程收尾
+        if [ "$err_printed" = 0 ]; then
+            local first_err
+            first_err="$(grep -m1 -E '^(FAILURE:|e: |> Task .* FAILED)' "$log" 2>/dev/null || true)"
+            if [ -n "$first_err" ]; then
+                printf '   %s[构建已报错]%s %s\n' "$C_R" "$C_0" "$first_err"
+                err_printed=1
+            fi
+        fi
+
+        # 每 30 秒打一行心跳，说明没卡死（不管有没有新任务都打）
         if [ "$((now - last_report))" -ge 30 ]; then
             elapsed="$((now - start))"
+            cache_mb="$(du -sm "$GRADLE_USER_HOME_DIR" 2>/dev/null | cut -f1)"
+            [ -z "$cache_mb" ] && cache_mb=0
             printf '   %s⏳ 已运行 %dm%02ds%s' \
                 "$C_Y" "$((elapsed / 60))" "$((elapsed % 60))" "$C_0"
             if [ -n "$last_task_line" ]; then
@@ -406,7 +446,13 @@ gradle_with_progress() {
             else
                 printf '   正在配置项目 / 下载依赖'
             fi
-            printf '\n'
+            printf '   依赖缓存 %sM   日志静默 %ss\n' "$cache_mb" "$silent"
+
+            # 3 分钟没有任何输出：多半是卡在下载，给出可操作的提示（只提示一次）
+            if [ "$silent" -ge 180 ] && [ "$stuck_hinted" = 0 ]; then
+                warn "已经 ${silent}s 没有新输出，多半卡在下载依赖：$CACHE_ROOT/gradle-build.log"
+                stuck_hinted=1
+            fi
             last_report="$now"
         fi
     done
@@ -457,6 +503,14 @@ build_apk() {
         warn "首次构建会下载全部依赖（几个 GB），耗时长属正常，不要中断"
         say ""
     fi
+    if [ "$MIRROR" != "off" ] && [ -f "$MIRROR_INIT" ]; then
+        ok "依赖镜像：阿里云（google / mavenCentral / gradle-plugin 前置，jitpack 保持直连）"
+    elif [ "$MIRROR" = "off" ]; then
+        warn "依赖镜像：已按 MIRROR=off 关闭，直连 google / mavenCentral（国内很慢）"
+    else
+        warn "依赖镜像：找不到 $MIRROR_INIT，直连 google / mavenCentral（国内很慢）"
+    fi
+
     say "开始编译，下面会实时显示 Gradle 任务；长时间无任务输出时会打心跳"
 
     # 预置给 gradle_with_progress 回填，set -u 下也能安全引用
