@@ -241,6 +241,109 @@ prepare_project() {
 
 # ============================================================ 构建
 
+# 把 Gradle 的任务名翻译成人话，心跳时显示更有用
+friendly_task() {
+    case "$1" in
+        *minifyReleaseWithR8*|*minifyRelease*)
+            printf 'R8 压缩代码（最慢的一步）' ;;
+        *lintVital*|*lint*)
+            printf 'lint 检查' ;;
+        *compileReleaseKotlin*)
+            printf '编译 Kotlin' ;;
+        *kspReleaseKotlin*|*Ksp*)
+            printf 'KSP 注解处理' ;;
+        *processReleaseResources*|*mergeReleaseResources*)
+            printf '处理资源' ;;
+        *dexBuilder*|*mergeDex*|*Dex*)
+            printf '生成 dex' ;;
+        *packageRelease*)
+            printf '打包 APK' ;;
+        *test*Release*)
+            printf '跑测试' ;;
+        *Resolve*|*download*)
+            printf '解析/下载依赖' ;;
+        *)
+            printf '%s' "$1" ;;
+    esac
+}
+
+# 跑 gradle，同时把任务行实时刷出来，并每 30 秒打一行心跳。
+# 之所以自己接管输出：Gradle 打完 "Daemon will be stopped" 之后，
+# Kotlin 编译 / R8 / lint 会安静好几分钟，看起来像卡死。
+gradle_with_progress() {
+    local log="$CACHE_ROOT/gradle-build.log"
+    mkdir -p "$CACHE_ROOT"
+    : > "$log"
+
+    local start pid rc
+    start="$(date +%s)"
+
+    "$GRADLE_HOME/bin/gradle" assembleRelease --console=plain --no-daemon \
+        >>"$log" 2>&1 &
+    pid=$!
+
+    # 输出被重定向（CI 或 `> file`）时不刷心跳，避免污染日志
+    if [ ! -t 1 ]; then
+        set +e
+        wait "$pid"; rc=$?
+        set -e
+        cat "$log"
+        return "$rc"
+    fi
+
+    local printed=0 now elapsed total label last_task_line="" last_report="$start"
+
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 2
+        kill -0 "$pid" 2>/dev/null || break
+
+        # 把新出现的任务行刷到终端
+        total="$(grep -c '^> Task ' "$log" 2>/dev/null || true)"
+        [ -z "$total" ] && total=0
+        if [ "$total" -gt "$printed" ]; then
+            grep '^> Task ' "$log" | tail -n "$((total - printed))" |
+                sed 's/^> Task /     · /'
+            printed="$total"
+            # 记下最后一个任务名，心跳时一起显示
+            last_task_line="$(grep '^> Task ' "$log" | tail -1 | sed 's/^> Task //')"
+        fi
+
+        # 每 30 秒打一行心跳，说明没卡死（不管有没有新任务都打）
+        now="$(date +%s)"
+        if [ "$((now - last_report))" -ge 30 ]; then
+            elapsed="$((now - start))"
+            printf '   %s⏳ 已运行 %dm%02ds%s' \
+                "$C_Y" "$((elapsed / 60))" "$((elapsed % 60))" "$C_0"
+            if [ -n "$last_task_line" ]; then
+                label="$(friendly_task "$last_task_line")"
+                printf '   当前：%s' "$label"
+            else
+                printf '   正在配置项目 / 下载依赖'
+            fi
+            printf '\n'
+            last_report="$now"
+        fi
+    done
+
+    set +e
+    wait "$pid"; rc=$?
+    set -e
+
+    # 收尾：把循环里还没刷出来的任务行补上
+    total="$(grep -c '^> Task ' "$log" 2>/dev/null || true)"
+    [ -z "$total" ] && total=0
+    if [ "$total" -gt "$printed" ]; then
+        grep '^> Task ' "$log" | tail -n "$((total - printed))" |
+            sed 's/^> Task /     · /'
+    fi
+
+    elapsed="$(( $(date +%s) - start ))"
+    BUILD_SECONDS="$elapsed"
+    BUILD_TASKS="$total"
+
+    return "$rc"
+}
+
 build_apk() {
     step "编译 release"
 
@@ -260,8 +363,30 @@ build_apk() {
     say "gradle           = $GRADLE_HOME/bin/gradle"
     say ""
 
+    # 第一次构建要拉全量依赖，提前打招呼，免得以为卡住
+    if [ ! -d "$GRADLE_USER_HOME_DIR/caches/modules-2" ]; then
+        warn "首次构建会下载全部依赖（几个 GB），耗时长属正常，不要中断"
+        say ""
+    fi
+    say "开始编译，下面会实时显示 Gradle 任务；长时间无任务输出时会打心跳"
+
+    # 预置给 gradle_with_progress 回填，set -u 下也能安全引用
+    BUILD_SECONDS=0
+    BUILD_TASKS=0
+
     cd "$PROJECT_DIR"
-    "$GRADLE_HOME/bin/gradle" assembleRelease --console=plain --no-daemon
+    local rc=0
+    gradle_with_progress || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        # 失败时把日志尾部捞出来，别让人自己去翻文件
+        printf '\n%s---- 构建失败，日志末 30 行 ----%s\n' "$C_R" "$C_0" >&2
+        tail -n 30 "$CACHE_ROOT/gradle-build.log" >&2
+        die "构建失败（退出码 $rc）
+  完整日志：$CACHE_ROOT/gradle-build.log"
+    fi
+
+    ok "构建完成（${BUILD_TASKS:-0} 个任务，耗时 $((BUILD_SECONDS / 60))m$((BUILD_SECONDS % 60))s）"
 
     [ -f "$UNSIGNED_APK" ] || die "构建结束但没找到产物：$UNSIGNED_APK"
     ok "产物：$(basename "$UNSIGNED_APK")"
