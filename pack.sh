@@ -38,7 +38,10 @@ BUILD_USER="${BUILD_USER:-itdev}"
 JDK_DIR_NAME="jdk-17.0.21"
 GRADLE_VER="9.9.0"
 PLATFORM_ID="android-37.0"      # compileSdk = 37
-BUILD_TOOLS_VER="37.0.0"
+BUILD_TOOLS_VER="37.0.0"        # 脚本签名用这个版本
+# 构建需要的 build-tools：AGP 9.5.1 默认用 36.0.0（项目没声明 buildToolsVersion），
+# 所以 36.0.0 必须存在，否则 Gradle 会去下载并因许可证失败
+REQUIRED_BUILD_TOOLS=("37.0.0" "36.0.0")
 
 # 签名
 KS_PASS="000777"
@@ -181,10 +184,20 @@ check_toolchain() {
         warn "缺 platform：$SDK_HOME/platforms/$PLATFORM_ID"; missing=1
     fi
 
-    if [ -x "$SDK_HOME/build-tools/$BUILD_TOOLS_VER/apksigner" ]; then
-        ok "build-tools $BUILD_TOOLS_VER"
+    local v
+    for v in "${REQUIRED_BUILD_TOOLS[@]}"; do
+        if [ -x "$SDK_HOME/build-tools/$v/apksigner" ]; then
+            ok "build-tools $v"
+        else
+            warn "缺 build-tools $v：$SDK_HOME/build-tools/$v"; missing=1
+        fi
+    done
+
+    # 没有许可证文件，Gradle 会在装缺失组件时直接报 "licences have not been accepted"
+    if [ -f "$SDK_HOME/licenses/android-sdk-license" ]; then
+        ok "SDK 许可证"
     else
-        warn "缺 build-tools：$SDK_HOME/build-tools/$BUILD_TOOLS_VER"; missing=1
+        warn "缺 SDK 许可证：$SDK_HOME/licenses/android-sdk-license"; missing=1
     fi
 
     if [ "$missing" = 1 ]; then

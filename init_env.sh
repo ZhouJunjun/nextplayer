@@ -46,10 +46,16 @@ JDK_TARBALL="OpenJDK17U-jdk_x64_linux_hotspot_17.0.21_9.tar.gz"
 GRADLE_VER="9.9.0"
 GRADLE_SHA256="0b00b0ffe07c4d4789c12d4935a44a7057d55774b7540bd4a3f76f336deb177a"
 PLATFORM_ID="android-37.0"      # compileSdk = 37
-BUILD_TOOLS_VER="37.0.0"
+# 37.0.0 是脚本签名用的；36.0.0 是 AGP 9.5.1 的默认 build-tools 版本，
+# 项目没有显式声明 buildToolsVersion，所以 Gradle 会去找 36.0.0，缺了就构建失败。
+BUILD_TOOLS_VERS=("37.0.0" "36.0.0")
 
 PLATFORM_ZIP="platform-37.0_r02.zip"
-BUILDTOOLS_ZIP="build-tools_r37_linux.zip"
+# build-tools 的 zip 名和版本号不是一一对应（r37/r36），用关联数组映射
+declare -A BUILD_TOOLS_ZIP_MAP=(
+    ["37.0.0"]="build-tools_r37_linux.zip"
+    ["36.0.0"]="build-tools_r36_linux.zip"
+)
 PLATFORMTOOLS_ZIP="platform-tools_r37.0.3-linux.zip"
 
 # 镜像优先，官方兜底
@@ -263,13 +269,21 @@ ensure_gradle() {
 ensure_sdk() {
     step "Android SDK"
 
-    local platform_ok=0 buildtools_ok=0
+    local platform_ok=0
     [ -f "$SDK_HOME/platforms/$PLATFORM_ID/android.jar" ] && platform_ok=1
-    [ -x "$SDK_HOME/build-tools/$BUILD_TOOLS_VER/apksigner" ] && buildtools_ok=1
 
-    if [ "$platform_ok" = 1 ] && [ "$buildtools_ok" = 1 ]; then
+    # 检查所有需要的 build-tools 版本
+    local v all_bt_ok=1
+    for v in "${BUILD_TOOLS_VERS[@]}"; do
+        [ -x "$SDK_HOME/build-tools/$v/apksigner" ] || all_bt_ok=0
+    done
+
+    if [ "$platform_ok" = 1 ] && [ "$all_bt_ok" = 1 ]; then
         ok "已存在 $SDK_HOME"
-        say "platform $PLATFORM_ID + build-tools $BUILD_TOOLS_VER"
+        say "platform $PLATFORM_ID"
+        for v in "${BUILD_TOOLS_VERS[@]}"; do
+            say "build-tools $v"
+        done
         return 0
     fi
 
@@ -291,26 +305,33 @@ ensure_sdk() {
         ok "platform 完成"
     fi
 
-    # ---- build-tools ----
-    if [ "$buildtools_ok" = 1 ]; then
-        ok "build-tools $BUILD_TOOLS_VER 已存在"
-    else
-        say "安装 build-tools $BUILD_TOOLS_VER"
+    # ---- build-tools（逐个版本装，zip 内层目录名是 android-XX.Y，要改名成版本号）----
+    local zipname
+    for v in "${BUILD_TOOLS_VERS[@]}"; do
+        if [ -x "$SDK_HOME/build-tools/$v/apksigner" ]; then
+            ok "build-tools $v 已存在"
+            continue
+        fi
+
+        zipname="${BUILD_TOOLS_ZIP_MAP[$v]:-}"
+        [ -n "$zipname" ] || die "内部错误：build-tools $v 没有对应的 zip 名"
+
+        say "安装 build-tools $v"
         local tmp; tmp="$(new_tmp)"
-        fetch_required "$SDK_MIRROR/$BUILDTOOLS_ZIP" "$tmp/b.zip" "$SDK_MIRROR_ALT/$BUILDTOOLS_ZIP"
-        check_archive_size "$tmp/b.zip" 40000000 "build-tools $BUILD_TOOLS_VER"
+        fetch_required "$SDK_MIRROR/$zipname" "$tmp/b.zip" "$SDK_MIRROR_ALT/$zipname"
+        check_archive_size "$tmp/b.zip" 30000000 "build-tools $v"
         unzip -q "$tmp/b.zip" -d "$tmp/x"
-        # zip 里的目录名是 android-37.0，SDK 要求按版本号命名
+
         local src
         src="$(find "$tmp/x" -maxdepth 1 -mindepth 1 -type d | head -1)"
-        [ -n "$src" ] || die "build-tools 压缩包结构异常"
-        rm -rf "$SDK_HOME/build-tools/$BUILD_TOOLS_VER"
-        mv "$src" "$SDK_HOME/build-tools/$BUILD_TOOLS_VER"
-        chmod +x "$SDK_HOME/build-tools/$BUILD_TOOLS_VER"/{aapt2,apksigner,zipalign} 2>/dev/null || true
-        [ -x "$SDK_HOME/build-tools/$BUILD_TOOLS_VER/apksigner" ] ||
-            die "build-tools 安装后找不到 apksigner"
-        ok "build-tools 完成"
-    fi
+        [ -n "$src" ] || die "build-tools $v 压缩包结构异常"
+        rm -rf "$SDK_HOME/build-tools/$v"
+        mv "$src" "$SDK_HOME/build-tools/$v"
+        chmod +x "$SDK_HOME/build-tools/$v"/{aapt2,apksigner,zipalign} 2>/dev/null || true
+        [ -x "$SDK_HOME/build-tools/$v/apksigner" ] ||
+            die "build-tools $v 安装后找不到 apksigner"
+        ok "build-tools $v 完成"
+    done
 
     # ---- platform-tools（可选，编译不需要；装了只是让 SDK 目录完整）----
     if [ ! -d "$SDK_HOME/platform-tools" ]; then
@@ -333,6 +354,41 @@ ensure_sdk() {
     ok "Android SDK 就绪：$SDK_HOME"
 }
 
+# ============================================================ SDK 许可证
+
+# Gradle 装 SDK 组件前会查 licenses 目录。只解压 zip 是不够的：
+# 没有许可证文件，Gradle 会报 "Failed to install the following Android SDK packages
+# as some licences have not been accepted"，构建直接失败。
+ensure_sdk_licenses() {
+    step "SDK 许可证"
+
+    local dir="$SDK_HOME/licenses"
+    mkdir -p "$dir"
+
+    # 这两个哈希是 Android SDK 的 standard license 与 build-tools license，
+    # 内容就是 sdkmanager --licenses 同意后写入的东西。
+    local changed=0 f hash
+    while IFS=':' read -r f hash; do
+        [ -n "$f" ] || continue
+        if [ -f "$dir/$f" ] && grep -qxF "$hash" "$dir/$f" 2>/dev/null; then
+            continue
+        fi
+        printf '
+%s
+' "$hash" >> "$dir/$f"
+        chown -R "$(stat -c %U "$SDK_HOME"):" "$dir" 2>/dev/null || true
+        changed=1
+    done <<'EOF'
+android-sdk-license:24333f8a63b6825ea9c5514f83c2829b004d1fee
+android-sdk-preview-license:84831b9409646a918e30573bab4c9c91346d8abd
+EOF
+
+    if [ "$changed" = 1 ]; then
+        ok "已写入许可证：$dir"
+    else
+        ok "许可证已存在"
+    fi
+}
 # ============================================================ 项目归属交接
 
 # root 装环境时如果之前有人用 root 跑过构建，项目里会残留 root 所有的目录，
@@ -414,6 +470,7 @@ main() {
     ensure_jdk
     ensure_gradle
     ensure_sdk
+    ensure_sdk_licenses
     hand_over_project
 
     # 提示怎么验、怎么跑
