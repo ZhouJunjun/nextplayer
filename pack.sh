@@ -12,8 +12,8 @@
 #   CPU_LIMIT=2 MEM_LIMIT_MB=2048 sh pack.sh   # 临时再压低编译用的资源
 #
 # 资源上限（默认）：
-#   内存 4G —— 拆成 Gradle 堆 2.25G + 元空间 0.375G、Kotlin 守护进程 0.625G + 0.25G，
-#              其余留给 JIT 与原生工具；能拿到 systemd user manager 时再加 cgroup MemoryMax 硬限
+#   内存 4G —— 拆成 Gradle 堆 2G + 元空间 0.375G、Kotlin 守护进程 0.5G + 0.25G，
+#              其余留给 JVM 开销；能拿到 systemd user manager 时再加 cgroup MemoryMax 硬限
 #   CPU  4 核 —— 机器共 8 核，构建只绑 0-3，另外 4 核留给别的服务；同时 Gradle 并发数 = 4
 #
 # 做什么：
@@ -62,11 +62,12 @@ CPU_LIMIT="${CPU_LIMIT:-4}"
 # 前置成阿里云镜像，镜像里没有的构件仍回落到原仓库。MIRROR=off 可关掉。
 MIRROR="${MIRROR:-on}"
 
-# 4G 预算怎么分：Gradle 主进程 2.25G 堆 + 0.375G 元空间，Kotlin 编译守护进程 0.625G 堆
-# + 0.25G 元空间，合计 3.5G，剩下约 0.5G 留给 JIT 代码缓存、线程栈和 AAPT2 这类原生工具。
-GRADLE_HEAP_MB=$((MEM_LIMIT_MB * 9 / 16))
+# 4G 预算怎么分（cgroup 算的是实际 RSS，比堆大：还有元空间、代码缓存、线程栈、直接内存）：
+# Gradle 主进程 2G 堆 + 0.375G 元空间，Kotlin 守护进程 0.5G + 0.25G，合计 3.125G，
+# 留约 0.9G 给 JVM 自身开销。上一版合计 3.5G、余量太薄，R8 阶段被 cgroup OOM 杀掉过。
+GRADLE_HEAP_MB=$((MEM_LIMIT_MB / 2))
 GRADLE_META_MB=$((MEM_LIMIT_MB * 3 / 32))
-KOTLIN_HEAP_MB=$((MEM_LIMIT_MB * 5 / 32))
+KOTLIN_HEAP_MB=$((MEM_LIMIT_MB / 8))
 KOTLIN_META_MB=$((MEM_LIMIT_MB / 16))
 
 # ============================================================ 路径
@@ -525,6 +526,30 @@ build_apk() {
         # 失败时把日志尾部捞出来，别让人自己去翻文件
         printf '\n%s---- 构建失败，日志末 30 行 ----%s\n' "$C_R" "$C_0" >&2
         tail -n 30 "$CACHE_ROOT/gradle-build.log" >&2
+
+        # 日志被硬切断（没有 BUILD FAILED 也没有编译错误）说明进程是被信号杀掉的，
+        # 最常见的是 cgroup MemoryMax 触发 OOM。这种情况 Gradle 来不及写任何错误。
+        local hint=""
+        case "$rc" in
+            137)
+                hint="退出码 137 = 被 SIGKILL 杀掉，最常见的原因是 cgroup 内存超限（MemoryMax=${MEM_LIMIT_MB}M）。
+  确认方式：
+    sudo journalctl -k | grep -i -E 'oom|killed process' | tail -5
+  确实是被杀：把上限放宽再试一次
+    MEM_LIMIT_MB=6144 sh pack.sh
+  要守住 4G：把 R8 阶段的并发降下来
+    CPU_LIMIT=2 sh pack.sh" ;;
+            143)
+                hint="退出码 143 = 被 SIGTERM 杀掉，多半是手工 Ctrl+C 或 SSH 会话断开导致整棵进程树被回收。" ;;
+            1)
+                hint="退出码 1 = Gradle 自己报错，原因见上面日志里的 FAILURE 段。" ;;
+        esac
+
+        if [ -n "$hint" ]; then
+            printf '\n%s诊断：%s\n' "$C_Y" "$C_0" >&2
+            printf '  %s\n' "$hint" >&2
+        fi
+
         die "构建失败（退出码 $rc）
   完整日志：$CACHE_ROOT/gradle-build.log"
     fi
