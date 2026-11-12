@@ -133,7 +133,7 @@ fi
 step() { RUN_STAGE="$*"; printf '\n%s==> %s%s\n' "$C_B$C_BOLD" "$*" "$C_0"; }
 ok()   { printf '  %s[ ok ]%s %s\n' "$C_G" "$C_0" "$*"; }
 warn() { printf '  %s[warn]%s %s\n' "$C_Y" "$C_0" "$*"; }
-die()  { printf '\n%s[FAIL]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+die()  { DIED=1; printf '\n%s[FAIL]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 say()  { printf '  %s\n' "$*"; }
 
 # 进度行一律走 stdout。上一版在 `| tee` 时改投 /dev/tty，结果终端有进度、
@@ -145,6 +145,7 @@ progress_out() { cat; }
 
 RUN_START_EPOCH=0
 RUN_STAGE="启动"
+DIED=0
 
 # 退出时无条件写结论。信号中断时 EXIT 也会跟着触发，所以这里能覆盖所有路径。
 record_exit() {
@@ -160,6 +161,14 @@ record_exit() {
         printf 'hs_err=%s\n' "$(ls -t "$PROJECT_DIR"/hs_err_pid*.log "$CACHE_ROOT"/hs_err_pid*.log 2>/dev/null | head -1 || echo '-')"
         printf 'log=%s\n' "$CACHE_ROOT/gradle-build.log"
     } >"$STATE_FILE.tmp" 2>/dev/null && mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null
+
+    # 没走 die、也不是信号：典型是 set -e 被某个管道/子命令悄悄绊倒。
+    # 这种情况屏幕上什么都不会有，必须自己说出来，否则又是"没下文"。
+    if [ "$rc" -ne 0 ] && [ "$DIED" = "0" ]; then
+        printf '\n%s[FAIL]%s 脚本在「%s」阶段异常退出（退出码 %s），未走到正常报错分支。\n' \
+            "$C_R" "$C_0" "$RUN_STAGE" "$rc" >&2
+        printf '  结论文件：%s\n' "$STATE_FILE" >&2
+    fi
     return 0
 }
 
@@ -172,6 +181,7 @@ on_signal() {
         *)   code=143 ;;
     esac
     RUN_STAGE="被信号 $sig 中断"
+    DIED=1
     trap - EXIT
     printf '\n%s[中断]%s 收到 %s：构建进程已终止，结论见 %s\n' \
         "$C_R" "$C_0" "$sig" "$STATE_FILE" >&2
@@ -269,7 +279,7 @@ find_existing_jdk() {
         [ -x "$d/bin/javac" ] && [ -x "$d/bin/java" ] || continue
 
         # 按 java -version 的实际版本判断，不看目录名 —— 目录名可能和真实版本不一致
-        ver="$("$d/bin/java" -version 2>&1 | head -1)"
+        ver="$("$d/bin/java" -version 2>&1 | sed -n '1p')"
         major="$(printf '%s\n' "$ver" | sed -n 's/.*version "\([0-9]*\)[."].*/\1/p')"
         [ "$major" = "17" ] || continue
 
@@ -289,7 +299,7 @@ check_toolchain() {
     if found="$(find_existing_jdk)"; then
         JDK_HOME="$found"
         ok "JDK      $JDK_HOME"
-        say "         $("$JDK_HOME/bin/java" -version 2>&1 | head -1)"
+        say "         $("$JDK_HOME/bin/java" -version 2>&1 | sed -n '1p')"
     else
         JDK_HOME="$PREFIX/$JDK_DIR_NAME"
         warn "缺 JDK 17：$PREFIX 下没找到可用的 jdk-17*"; missing=1
@@ -736,19 +746,26 @@ sign_apk() {
     local aapt2="$bt/aapt2"
     [ -x "$apksigner" ] || die "找不到 apksigner：$apksigner"
 
-    # 版本号从构建脚本里读，不写死在脚本里
+    # apksigner 是 shell 脚本，内部靠 PATH 里的 java 启动，只设 JAVA_HOME 不够
+    export JAVA_HOME="$JDK_HOME"
+    export PATH="$JDK_HOME/bin:$PATH"
+    say "apksigner：$apksigner"
+    say "JAVA     ：$(command -v java || echo '未找到')"
+
+    # 版本号从构建脚本里读，不写死在脚本里。
+    # 这里不能接 `| head -1`：head 读够就关管道，上游 sed 会吃 SIGPIPE，
+    # 配上 pipefail + set -e 就是"静默退出"，什么都不打印。
     local version="unknown"
     local v
     v="$(sed -n 's/.*versionName *= *"\([^"]*\)".*/\1/p' \
-        "$PROJECT_DIR/app/build.gradle.kts" 2>/dev/null | head -1)"
+        "$PROJECT_DIR/app/build.gradle.kts" 2>/dev/null | sed -n '1p')"
     [ -n "$v" ] && version="$v"
 
     local stamp out
     stamp="$(date +%y%m%d_%H%M%S)"
     out="$PROJECT_DIR/nextplayer_${stamp}_appRelease_${version}_arm64.apk"
 
-    export JAVA_HOME="$JDK_HOME"
-
+    say "签名：$(basename "$UNSIGNED_APK") → $(basename "$out")"
     "$apksigner" sign \
         --ks "$KEYSTORE" \
         --ks-key-alias "$KS_ALIAS" \
@@ -758,13 +775,16 @@ sign_apk() {
         --v2-signing-enabled true \
         --v3-signing-enabled true \
         --out "$out" \
-        "$UNSIGNED_APK"
+        "$UNSIGNED_APK" ||
+        die "apksigner sign 失败（keystore：$KEYSTORE）"
 
     # apksigner 会顺带写 .idsig，不留
     rm -f "$out.idsig"
 
     say "校验签名"
-    "$apksigner" verify --print-certs "$out" | head -3
+    # 同上：用 sed 读完全部输出再取前 3 行，不给 apksigner 制造 SIGPIPE
+    "$apksigner" verify --print-certs "$out" 2>&1 | sed -n '1,3p' ||
+        die "apksigner verify 失败：$out"
 
     if [ -x "$aapt2" ]; then
         say "APK 信息"
