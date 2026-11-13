@@ -406,17 +406,7 @@ class PlayerService : MediaSessionService() {
             )
 
             if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM) {
-                if (mediaSession?.player?.repeatMode != Player.REPEAT_MODE_OFF) {
-                    mediaSession?.player?.seekTo(0)
-                    mediaSession?.player?.play()
-                    return
-                }
-                hideFloatingWindow(restoreWakeMode = false)
-                mediaSession?.run {
-                    player.clearMediaItems()
-                    player.stop()
-                }
-                stopSelf()
+                onCurrentMediaItemEnded()
             }
         }
 
@@ -492,9 +482,52 @@ class PlayerService : MediaSessionService() {
         }
     }
 
+    /**
+     * 当前视频播完后的收尾，行为与切小窗前的播放设置保持一致。
+     *
+     * 走到这里的时机有两种：整条队列播到最后一个，或者队列还有下一项但用户关掉了
+     * 自动播放（此时 pauseAtEndOfMediaItems 为 true，播放器在当前项结尾主动暂停）。
+     * 两种情况都会报 END_OF_MEDIA_ITEM，所以必须分开判断，不能一律关窗。
+     *
+     *  - 单曲循环（loopMode = ONE）：把进度拉回 0 再播，和播放器内一致。
+     *  - 队列里还有下一项：小窗留着。自动播放开着时播放器已经自己过渡到下一集了，
+     *    关着时它会停在这里等用户手动继续 —— 两种都跟播放器内的表现一致。
+     *  - 队列真的到头了：先收小窗，再清队列停服务。
+     *
+     * 早先的实现只看 repeatMode，非 OFF 就重播当前、OFF 就直接关窗清队列 ——
+     * 于是「自动播放下一集」在小窗里永远不生效，播完一集窗口就没了。
+     */
+    private fun onCurrentMediaItemEnded() {
+        val session = mediaSession ?: return
+        val player = session.player
+
+        // 单曲循环：当前项原地重播（小窗和应用内都是这个行为）
+        if (player.repeatMode == Player.REPEAT_MODE_ONE) {
+            player.seekTo(0)
+            player.play()
+            return
+        }
+
+        // 下面这些只对小窗生效。
+        // 应用内有自己的收尾逻辑（PlayerActivity 在 STATE_ENDED 时 finish + stopPlayerSession），
+        // 这里插手会把它的清理流程挡住，留下不退出的后台服务。
+        if (floatingWindow != null) {
+            // 队列里还有下一项：小窗留着。自动播放开着时播放器已经自己过渡到下一集，
+            // 关着时它会停在这里等用户手动继续 —— 两种都跟播放器内的表现一致。
+            if (player.hasNextMediaItem()) {
+                return
+            }
+        }
+
+        // 整条队列到头了：收工
+        hideFloatingWindow(restoreWakeMode = false)
+        player.clearMediaItems()
+        player.stop()
+        stopSelf()
+    }
+
     private fun setEnhancerTargetGain(gain: Int) {
         val enhancer = loudnessEnhancer ?: return
-
         try {
             enhancer.setTargetGain(gain)
             enhancer.enabled = gain > 0
