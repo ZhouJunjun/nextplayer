@@ -746,6 +746,72 @@ build_apk() {
 
 # ============================================================ 签名
 
+# 签名产物的内容级完整性自检。
+#
+# 为什么不能只靠 apksigner verify：它校验的是内存里的数据（刚写完还在页缓存），
+# 写盘阶段的损坏它看不见。实测遇到过一次——apksigner verify 通过，但 APK 里
+# classes.dex 和三个 .so 的内容和记录的 CRC 对不上，装到手机上就是"软件包似乎无效"。
+#
+# 做法：先 sync 把页缓存刷到盘上（这一步是关键，否则读的还是缓存，白验），
+# 再用 unzip -t 逐条解压比对 CRC —— 它读的是磁盘上的真实字节。
+verify_apk_integrity() {
+    local apk="$1"
+    step "完整性自检"
+
+    # 必须落盘后再读，否则校验的是缓存，写盘的坏损照样漏过去
+    sync 2>/dev/null || true
+    [ -s "$apk" ] || die "产物为空或不存在：$apk"
+
+    say "文件大小：$(awk -v b="$(wc -c <"$apk")" 'BEGIN{printf "%.1fMB", b/1048576}')"
+
+    # unzip -t 会逐条解压并比对 CRC，坏哪条报哪条
+    local log="$CACHE_ROOT/unzip-test.log"
+    mkdir -p "$CACHE_ROOT"
+    say "逐条校验 CRC（900 多条，约 10-30 秒，无输出属正常）"
+    local rc=0
+    unzip -t "$apk" >"$log" 2>&1 || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        # 只挑真正的失败行。注意不能用 `grep error`：资源文件名里常带 error
+        # （design_error.xml 之类），会把一堆 OK 行也捞进来。
+        # unzip 的失败形态有两种：
+        #   "testing: xxx   bad CRC 1234  (should be abcd)"   —— STORED 条目的 CRC 不符
+        #   "error:  invalid compressed data to inflate"      —— DEFLATE 条目解压失败
+        #   后者的文件名在前一行 "testing: xxx"，所以要把最后一次 testing 记住。
+        local badlist
+        badlist="$(awk '
+            /^ *testing: / {
+                name = $0
+                sub(/^ *testing: /, "", name)
+                sub(/ +OK$/, "", name)
+                last = name
+                if ($0 ~ /bad CRC/) { print "  " name "  ← 内容与记录的 CRC 不符" }
+                next
+            }
+            /invalid compressed data|bad CRC|cannot find|damaged/ {
+                if ($0 ~ /^ *error:/ && last != "") { print "  " last "  ← 解压失败" }
+                else { print "  " $0 }
+            }
+        ' "$log" | head -20)"
+
+        printf '\n%s以下条目校验失败：%s\n' "$C_R" "$C_0" >&2
+        [ -n "$badlist" ] && printf '%s\n' "$badlist" >&2
+        printf '\n完整日志：%s\n' "$log" >&2
+        die "APK 内容完整性校验失败（unzip -t 退出码 $rc）
+  这个包装到设备上会提示「软件包似乎无效」，不要安装、不要分发。
+  常见原因：签名写盘时出错、磁盘/内存异常、或 .build-cache 所在分区有问题。
+  建议：删除 .build-cache 后重跑；仍失败则检查 df -h 与 dmesg。"
+    fi
+    ok "全部条目 CRC 校验通过"
+
+    # 再算一次整包 sha256，便于跨机核对（sz 传完可以比一下）
+    local sha
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha="$(sha256sum "$apk" | awk '{print $1}')"
+        say "SHA-256：$sha"
+    fi
+}
+
 sign_apk() {
     step "签名"
 
@@ -835,6 +901,9 @@ sign_apk() {
         die "apksigner verify 失败（退出码 $rc）：$out"
     fi
     sed -n '1,3p' "$verify_log" | sed 's/^/  /'
+
+    # apksigner verify 只看内存里的数据，写盘损坏它漏得过去 —— 再按磁盘字节验一遍
+    verify_apk_integrity "$out"
 
     if [ -x "$aapt2" ]; then
         say "APK 信息"
