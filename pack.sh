@@ -73,7 +73,7 @@ KS_ALIAS="nextplayer"
 # 装到手机上就是「软件包似乎无效」。scp 不经过终端，没这个毛病。
 # 关掉：UPLOAD=off sh pack.sh
 UPLOAD="${UPLOAD:-on}"
-UPLOAD_USER="${UPLOAD_USER:-zjj}"
+UPLOAD_USER="${UPLOAD_USER:-itdev}"
 UPLOAD_HOST="${UPLOAD_HOST:-10.19.118.10}"
 UPLOAD_DIR="${UPLOAD_DIR:-/data/download/junjunzhou}"
 
