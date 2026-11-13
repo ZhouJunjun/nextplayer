@@ -22,6 +22,7 @@ import android.view.WindowManager
 import android.view.accessibility.CaptioningManager
 import android.widget.FrameLayout
 import android.widget.ImageButton
+import android.widget.ImageView
 import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
@@ -57,6 +58,14 @@ private const val TOP_BUTTON_PADDING_DP = 11
 private const val TOP_BUTTON_MARGIN_DP = 4
 private const val CENTER_BUTTON_SIZE_DP = 128
 private const val CENTER_BUTTON_PADDING_DP = 32
+/**
+ * 居中播放/暂停图标的实际绘制尺寸。
+ *
+ * 这些 vector 图标都声明成 24dp，而 ImageButton 默认的 FIT_CENTER 只会按固有尺寸绘制、
+ * 不会放大 —— 所以按钮容器即使做到 128dp，图标看着还是 24dp。这里显式指定 48dp，
+ * padding 由 (容器 - 图标) / 2 反推，图标居中且不拉伸。
+ */
+private const val CENTER_ICON_SIZE_DP = 48
 private const val PROGRESS_BAR_HEIGHT_DP = 3f
 private const val PROGRESS_TOUCH_HEIGHT_DP = 18
 private const val PROGRESS_HORIZONTAL_MARGIN_DP = 8
@@ -492,6 +501,9 @@ internal class FloatingPlayerWindow(
             iconRes = coreUiR.drawable.ic_pause,
             sizeDp = CENTER_BUTTON_SIZE_DP,
             paddingDp = CENTER_BUTTON_PADDING_DP,
+            // 图标按 48dp 画（原来是固有 24dp，缩在 128dp 的容器里显得很小）。
+            // 容器仍是 128dp，点击区域保持大一圈。
+            iconSizeDp = CENTER_ICON_SIZE_DP,
             onClick = { togglePlayback() },
         )
         val fullScreenButton = createButton(
@@ -567,17 +579,35 @@ internal class FloatingPlayerWindow(
         return container
     }
 
+    /**
+     * @param iconSizeDp 指定图标的实际绘制尺寸；不传则沿用图标自身的固有尺寸。
+     *
+     * ImageButton 默认的 FIT_CENTER 是按 drawable 的固有尺寸（这些图标都声明成 24dp）
+     * 居中绘制，只在超出边界时缩小、**永远不会放大**。之前把居中按钮容器从 64dp
+     * 改成 128dp 时，只有点击区域翻倍了，图标一个像素都没变（实测仍是 24dp）。
+     *
+     * 这里用「显式尺寸 + FIT_XY + 对称 padding」把图标顶到指定大小，padding 由容器和
+     * 目标尺寸反推，所以图标既不会糊在边上，也不会被拉伸变形（正方形区域画正方形图标）。
+     * 不传这个参数的按钮（左上/右上那些）维持原有行为，不受影响。
+     */
     private fun createButton(
         iconRes: Int,
         sizeDp: Int,
         paddingDp: Int,
+        iconSizeDp: Int? = null,
         onClick: () -> Unit,
     ): ImageButton = ImageButton(context).apply {
         setImageResource(iconRes)
         imageTintList = ColorStateList.valueOf(Color.WHITE)
         background = null
         val size = (sizeDp * density).toInt()
-        val padding = (paddingDp * density).toInt()
+        val padding = if (iconSizeDp != null) {
+            scaleType = ImageView.ScaleType.FIT_XY
+            // 图标撑满 padding 以内的方形区域，两者之差的一半就是四边留白
+            ((sizeDp - iconSizeDp) / 2f * density).toInt().coerceAtLeast(0)
+        } else {
+            (paddingDp * density).toInt()
+        }
         layoutParams = FrameLayout.LayoutParams(size, size)
         setPadding(padding, padding, padding, padding)
         setOnClickListener { onClick() }
