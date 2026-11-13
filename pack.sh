@@ -2,13 +2,13 @@
 #
 # nextplayer 编译打包 —— 目标系统 Rocky Linux 9.3 (Blue Onyx)
 #
-# 用业务用户（默认 itdev）执行。前置条件是先由 root 跑过一次 init_env.sh。
+# 用业务用户（默认 zjj）执行。前置条件是先由 root 跑过一次 init_env.sh。
 #
 # 用法：
 #   sh pack.sh
 #   bash pack.sh
 #   PREFIX=/opt/tools sh pack.sh     # init_env.sh 装到了自定义前缀时
-#   BUILD_USER=other sh pack.sh      # 业务用户名不是 itdev 时
+#   BUILD_USER=other sh pack.sh      # 业务用户名不是 zjj 时
 #   CPU_LIMIT=2 MEM_LIMIT_MB=2048 sh pack.sh   # 临时再压低编译用的资源
 #   KOTLIN_STRATEGY=daemon sh pack.sh          # Kotlin 编译改回独立守护进程（默认 in-process）
 #   LINT=on sh pack.sh                         # 保留 lintVital 检查（默认跳过）
@@ -19,8 +19,9 @@
 # 最后跑到的任务），终端断线也能在下次启动时看到；本次构建进程 pid 记在 build.pid。
 #
 # 资源上限（默认）：
-#   内存 4G —— 单个 JVM：Gradle 堆 2.5G + 元空间 0.375G，Kotlin 编译跑在这个堆里
-#              （4G 装不下两个 JVM：Gradle 2G + Kotlin 守护进程实测 Compose 编译器 OOM）；
+#   内存 6G —— 单个 JVM：Gradle 堆 3.75G + 元空间 0.562G，Kotlin 编译跑在这个堆里
+#              （原先 4G 装不下两个 JVM：Gradle 2G + Kotlin 守护进程实测 Compose 编译器 OOM；
+#               R8 压缩阶段 4G 也偏紧，故提到 6G）；
 #              能拿到 systemd user manager 时再加 cgroup MemoryMax 硬限
 #   CPU  4 核 —— 机器共 8 核，构建只绑 0-3，另外 4 核留给别的服务；
 #              Gradle 并发 --max-workers=2（in-process 时多个 Kotlin 编译共用一个堆）
@@ -47,7 +48,7 @@ fi
 
 PREFIX="${PREFIX:-/usr/local}"
 # 允许运行本脚本的业务用户。不是这个用户就直接退出。
-BUILD_USER="${BUILD_USER:-itdev}"
+BUILD_USER="${BUILD_USER:-zjj}"
 
 # 必须与 init_env.sh 保持一致
 JDK_DIR_NAME="jdk-17.0.21"
@@ -66,9 +67,9 @@ SCRIPT_VER="2026-11-12-r4"
 KS_PASS="000777"
 KS_ALIAS="nextplayer"
 
-# 编译期资源上限（运维要求：内存最多 4G；机器 8 核，构建只许用 4 核，其余留给别的服务）
+# 编译期资源上限（内存 6G；机器 8 核，构建只许用 4 核，其余留给别的服务）
 # 分两层做：JVM 堆与元空间给死上限（软限），再尽量套一层 cgroup（硬限）。
-MEM_LIMIT_MB="${MEM_LIMIT_MB:-4096}"
+MEM_LIMIT_MB="${MEM_LIMIT_MB:-6144}"
 CPU_LIMIT="${CPU_LIMIT:-4}"
 
 # 国内镜像：把 settings.gradle.kts 里的 google()/mavenCentral()/gradlePluginPortal()
@@ -76,18 +77,19 @@ CPU_LIMIT="${CPU_LIMIT:-4}"
 MIRROR="${MIRROR:-on}"
 
 # Kotlin 编译策略：in-process / daemon
-# 4G 里塞不下"Gradle 一个 JVM + Kotlin 一个 JVM"：Gradle 堆要 2G 以上（R8 吃堆），
+# 6G 里塞两个 JVM 也行，但仍保留 in-process：少一个 JVM 就少一份 RSS 开销。
+# 原先 4G 时塞不下"Gradle 一个 JVM + Kotlin 一个 JVM"：Gradle 堆要 2G 以上（R8 吃堆），
 # Kotlin 守护进程 512M 时实测 Compose 编译器直接 OutOfMemoryError: GC overhead limit exceeded，
-# 两份加起来再算 RSS 必然超 4G。in-process 把 Kotlin 编译放进 Gradle 自己那个堆里，
+# 两份加起来再算 RSS 必然超预算。in-process 把 Kotlin 编译放进 Gradle 自己那个堆里，
 # 只剩一个 JVM。要退回老办法：KOTLIN_STRATEGY=daemon sh pack.sh
 KOTLIN_STRATEGY="${KOTLIN_STRATEGY:-in-process}"
 
 # lint：assembleRelease 默认会挂 lintVitalRelease，要在 Gradle 进程里把整个模块的
-# UAST 过一遍，是这个 4G 预算里最重的一步，而且它只做检查、不改产物。
+# UAST 过一遍，是这个内存预算里最重的一步，而且它只做检查、不改产物。
 # 默认跳过；要照原样跑 lint 就 LINT=on sh pack.sh
 LINT="${LINT:-skip}"
 
-# 4G 预算（cgroup 算 RSS，比堆大：还有元空间、代码缓存、线程栈、直接内存）：
+# 内存预算（cgroup 算 RSS，比堆大：还有元空间、代码缓存、线程栈、直接内存）：
 # in-process 只有一份 JVM —— Gradle 堆 2.5G + 元空间 0.375G，其余约 1G 留给 JVM 开销。
 GRADLE_HEAP_MB=$((MEM_LIMIT_MB * 5 / 8))
 GRADLE_META_MB=$((MEM_LIMIT_MB * 3 / 32))
@@ -221,7 +223,7 @@ show_last_run() {
 # ============================================================ 身份闸门
 
 # 最前面就卡身份，不允许 root 或别的用户往下走。
-# root 构建会把 build/、.build-cache/ 写成 root 所有，之后 itdev 再也构建不了。
+# root 构建会把 build/、.build-cache/ 写成 root 所有，之后 zjj 再也构建不了。
 require_build_user() {
     local me; me="$(id -un)"
 
@@ -503,7 +505,7 @@ gradle_with_progress() {
     fi
 
     # lintVital 只在 release 包里做 fatal 检查，不改产物，却要吃一大口堆；
-    # 4G 预算下先跳过，需要时 LINT=on sh pack.sh 恢复
+    # 默认跳过，需要时 LINT=on sh pack.sh 恢复
     local lint_args=()
     if [ "$LINT" = "skip" ]; then
         lint_args=(
@@ -573,7 +575,7 @@ gradle_with_progress() {
         # 每 30 秒打一行心跳，说明没卡死（不管有没有新任务都打）
         if [ "$((now - last_report))" -ge 30 ]; then
             elapsed="$((now - start))"
-            # java 进程占的物理内存：贴着 4G 上限时能提前看出要被 OOM 杀掉
+            # java 进程占的物理内存：贴着上限时能提前看出要被 OOM 杀掉
             local rss_mb
             rss_mb="$(ps -o rss= -C java 2>/dev/null | awk '{s+=$1} END {printf "%d", s/1024}' || true)"
             [ -z "$rss_mb" ] && rss_mb=0
@@ -658,7 +660,7 @@ build_apk() {
     fi
 
     if [ "$LINT" = "skip" ]; then
-        ok "lint：跳过 lintVital（只做检查不改产物，4G 预算下最吃内存的一步）；LINT=on 可恢复"
+        ok "lint：跳过 lintVital（只做检查不改产物，最吃内存的一步）；LINT=on 可恢复"
     else
         warn "lint：保留 lintVital 检查，内存峰值会明显升高"
     fi
@@ -697,8 +699,8 @@ build_apk() {
   确认方式：
     sudo journalctl -k | grep -i -E 'oom|killed process' | tail -5
   确实是被杀：把上限放宽再试一次
-    MEM_LIMIT_MB=6144 sh pack.sh
-  要守住 4G：把并发再压一档
+    MEM_LIMIT_MB=$((MEM_LIMIT_MB * 3 / 2)) sh pack.sh
+  想守住当前 ${MEM_LIMIT_MB}M：把并发再压一档
     WORKERS=1 sh pack.sh" ;;
             143)
                 hint="退出码 143 = 被 SIGTERM 杀掉，多半是手工 Ctrl+C 或 SSH 会话断开导致整棵进程树被回收。" ;;
@@ -711,15 +713,15 @@ build_apk() {
                             hint="退出码 1，R8（${last_done}）阶段 OutOfMemoryError —— R8 要把全部 class 读进同一个堆，
   压缩阶段比编译阶段更吃内存，${GRADLE_HEAP_MB}M 不够。
   先放宽上限确认（只是内存，不占 CPU）：
-    MEM_LIMIT_MB=6144 sh pack.sh
-  必须守住 4G 时，让 R8 独占堆、不与别的任务并发：
+    MEM_LIMIT_MB=$((MEM_LIMIT_MB * 3 / 2)) sh pack.sh
+  想守住当前 ${MEM_LIMIT_MB}M：让 R8 独占堆、不与别的任务并发
     WORKERS=1 sh pack.sh" ;;
                         *)
                             hint="退出码 1，日志里有 OutOfMemoryError —— 是 JVM 堆不够，不是编译代码有问题。
-  想让 Kotlin 单独用大堆（会多占内存，4G 上限可能装不下）：
+  想让 Kotlin 单独用大堆（会多占内存，${MEM_LIMIT_MB}M 上限可能装不下）：
     KOTLIN_STRATEGY=daemon sh pack.sh
   想整体放宽上限再编：
-    MEM_LIMIT_MB=6144 sh pack.sh" ;;
+    MEM_LIMIT_MB=$((MEM_LIMIT_MB * 3 / 2)) sh pack.sh" ;;
                     esac
                 else
                     hint="退出码 1 = Gradle 自己报错，原因见上面日志里的 FAILURE 段。"

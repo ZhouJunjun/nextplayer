@@ -495,13 +495,19 @@ internal class FloatingPlayerWindow(
             onClick = { togglePlayback() },
         )
         val fullScreenButton = createButton(
-            iconRes = coreUiR.drawable.ic_fit_screen,
+            // 与应用内「切小窗」图标同源，箭头改为指向左上（表示回到应用）。
+            iconRes = coreUiR.drawable.ic_pip_exit,
             sizeDp = TOP_BUTTON_SIZE_DP,
             paddingDp = TOP_BUTTON_PADDING_DP,
             onClick = { onOpenFullScreen() },
         )
         cropButton = createButton(
-            iconRes = coreUiR.drawable.ic_crop_landscape,
+            // 初始图标按当前状态给，避免闪一下；updateCropButton() 之后会保持一致。
+            iconRes = if (isCropped) {
+                coreUiR.drawable.ic_width_wide
+            } else {
+                coreUiR.drawable.ic_fit_screen
+            },
             sizeDp = TOP_BUTTON_SIZE_DP,
             paddingDp = TOP_BUTTON_PADDING_DP,
             onClick = { toggleCrop() },
@@ -625,9 +631,28 @@ internal class FloatingPlayerWindow(
     private fun supportsCrop(aspect: Float): Boolean =
         aspect > CROP_TARGET_ASPECT_RATIO + 0.01f
 
+    /**
+     * Keeps the crop button in sync with the current state: hidden for videos that need no
+     * cropping, and the icon reflects what the button will do next.
+     *
+     * 图标语义（按需求指定，与播放器内 VideoContentScale 的映射不同）：
+     *   正在裁剪 → ic_width_wide（宽框 + 左右双竖线，表示铺满宽度、裁掉两侧）
+     *   原始比例 → ic_fit_screen（四角外扩 + 居中方框，表示完整显示）
+     */
     private fun updateCropButton() {
-        cropButton?.visibility =
-            if (supportsCrop(aspect = aspectRatio())) View.VISIBLE else View.GONE
+        val button = cropButton ?: return
+        if (!supportsCrop(aspect = aspectRatio())) {
+            button.visibility = View.GONE
+            return
+        }
+        button.visibility = View.VISIBLE
+        button.setImageResource(
+            if (isCropped) {
+                coreUiR.drawable.ic_width_wide
+            } else {
+                coreUiR.drawable.ic_fit_screen
+            },
+        )
     }
 
     private fun updatePlayPauseIcon(isPlaying: Boolean) {
