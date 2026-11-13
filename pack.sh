@@ -67,6 +67,16 @@ SCRIPT_VER="2026-11-12-r4"
 KS_PASS="000777"
 KS_ALIAS="nextplayer"
 
+# 打包成功后自动把 APK 推到内网下载机（走 scp，独立的 TCP 通道）。
+# 不要用 sz —— 实测 shell 的窗口标题转义序列会混进 ZMODEM 数据流，
+# 把包传坏（报 PROTOCOL: Only thing after ZFIN should be "OO"），
+# 装到手机上就是「软件包似乎无效」。scp 不经过终端，没这个毛病。
+# 关掉：UPLOAD=off sh pack.sh
+UPLOAD="${UPLOAD:-on}"
+UPLOAD_USER="${UPLOAD_USER:-zjj}"
+UPLOAD_HOST="${UPLOAD_HOST:-10.19.118.10}"
+UPLOAD_DIR="${UPLOAD_DIR:-/data/download/junjunzhou}"
+
 # 编译期资源上限（内存 6G；机器 8 核，构建只许用 4 核，其余留给别的服务）
 # 分两层做：JVM 堆与元空间给死上限（软限），再尽量套一层 cgroup（硬限）。
 MEM_LIMIT_MB="${MEM_LIMIT_MB:-6144}"
@@ -154,6 +164,8 @@ progress_out() { cat; }
 RUN_START_EPOCH=0
 RUN_STAGE="启动"
 DIED=0
+# 签名成功后才回填；预置成空串，供 set -u 下安全引用
+UPLOAD_APK=""
 
 # 退出时无条件写结论。信号中断时 EXIT 也会跟着触发，所以这里能覆盖所有路径。
 record_exit() {
@@ -912,6 +924,105 @@ sign_apk() {
     fi
 
     printf '\n%s产物：%s%s\n\n' "$C_BOLD" "$out" "$C_0"
+
+    # 给 upload_apk 用。放在最后，只有一路成功走到这里才会被设置。
+    UPLOAD_APK="$out"
+}
+
+# ============================================================ 上传
+
+# 打包成功后把 APK 推到内网下载机。
+#
+# 为什么要这么谨慎：scp 的失败方式很坑 —— 没有免密时会卡在密码提示上（脚本静默挂死），
+# 网络不通时会一直重试。所以这里强制 BatchMode + ConnectTimeout，
+# 并且**上传后再回来比一次 sha256**：链路坏掉时 scp 未必报错，
+# 但哈希对不上就一定是传坏了（这个项目被 sz 坑过一次）。
+upload_apk() {
+    step "上传 APK"
+
+    local apk="${UPLOAD_APK:-}"
+    if [ -z "$apk" ] || [ ! -s "$apk" ]; then
+        warn "没有可上传的产物，跳过"
+        return 0
+    fi
+
+    if [ "${UPLOAD:-on}" = "off" ]; then
+        say "UPLOAD=off，跳过"
+        return 0
+    fi
+
+    if ! command -v scp >/dev/null 2>&1; then
+        warn "缺少 scp 命令，跳过上传"
+        return 0
+    fi
+
+    local fname; fname="$(basename "$apk")"
+    local dest="${UPLOAD_DIR%/}/$fname"
+
+    say "源文件：$apk"
+    say "目标  ：$UPLOAD_USER@$UPLOAD_HOST:$dest"
+
+    local local_sha=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        local_sha="$(sha256sum "$apk" | awk '{print $1}')"
+    fi
+
+    # BatchMode=yes：不许交互提问（没配免密时立刻失败，而不是卡在密码提示上把脚本挂死）
+    # ConnectTimeout：连不上最多等 10 秒
+    # ServerAlive*：链路假死时能尽快发现，不会无限等
+    # 不覆盖 known_hosts：第一次连会记下主机指纹，之后复用（不写 /dev/null，
+    # 否则每次都被当成新主机，指纹校验形同虚设）
+    local ssh_opts="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
+
+    # 先探一下能不能连、目标目录在不在，避免传一半才发现目录不存在
+    if command -v ssh >/dev/null 2>&1; then
+        local probe
+        probe="$(ssh $ssh_opts "$UPLOAD_USER@$UPLOAD_HOST" \
+            "test -d '$UPLOAD_DIR' && echo OK || echo NODIR" 2>&1)" || true
+        case "$probe" in
+            *OK*)
+                : ;;
+            *NODIR*)
+                die "远端目录不存在：$UPLOAD_HOST:$UPLOAD_DIR
+  在远端执行一次：mkdir -p '$UPLOAD_DIR'" ;;
+            *)
+                die "连不上 $UPLOAD_USER@$UPLOAD_HOST（ssh 探测失败）
+  $probe
+  排查：① 本机是否已加对方公钥（免密）② 网络/防火墙
+  想跳过上传：UPLOAD=off sh pack.sh" ;;
+        esac
+    fi
+
+    say "开始上传（约 20MB，视网络而定）"
+    local rc=0
+    # shellcheck disable=SC2086
+    scp $ssh_opts "$apk" "$UPLOAD_USER@$UPLOAD_HOST:$dest" >"$CACHE_ROOT/scp.log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        sed -n '1,20p' "$CACHE_ROOT/scp.log" >&2 || true
+        die "scp 上传失败（退出码 $rc）
+  日志：$CACHE_ROOT/scp.log
+  想跳过上传：UPLOAD=off sh pack.sh"
+    fi
+    ok "上传完成"
+
+    # 回读远端哈希做比对。scp 报成功不等于内容正确（本项目被 sz 坑过）。
+    if [ -n "$local_sha" ] && command -v ssh >/dev/null 2>&1; then
+        local remote_sha=""
+        remote_sha="$(ssh $ssh_opts "$UPLOAD_USER@$UPLOAD_HOST" \
+            "sha256sum '$dest' 2>/dev/null | awk '{print \$1}'" 2>/dev/null)" || true
+        if [ -z "$remote_sha" ]; then
+            warn "无法回读远端哈希（远端可能没有 sha256sum），跳过校验"
+        elif [ "$remote_sha" = "$local_sha" ]; then
+            ok "哈希一致：$local_sha"
+        else
+            die "上传后哈希不一致，文件已损坏！
+  本地：$local_sha
+  远端：$remote_sha
+  这个包不要用，重新传一次。"
+        fi
+    fi
+
+    say "下载地址：$UPLOAD_USER@$UPLOAD_HOST:$dest"
 }
 
 # ============================================================ main
@@ -953,6 +1064,8 @@ main() {
     step "检查运行身份"
     require_build_user
 
+    git pull
+
     RUN_STAGE="检查环境"
     check_host
     check_toolchain
@@ -964,6 +1077,8 @@ main() {
         say "只签名模式：跳过编译，直接用现有未签名产物"
         RUN_STAGE="签名"
         sign_apk
+        RUN_STAGE="上传"
+        upload_apk
         RUN_STAGE="成功"
         printf '%s完成（仅签名）%s\n\n' "$C_G$C_BOLD" "$C_0"
         return 0
@@ -973,6 +1088,8 @@ main() {
     build_apk
     RUN_STAGE="签名"
     sign_apk
+    RUN_STAGE="上传"
+    upload_apk
     RUN_STAGE="成功"
 
     printf '%s完成%s\n\n' "$C_G$C_BOLD" "$C_0"
