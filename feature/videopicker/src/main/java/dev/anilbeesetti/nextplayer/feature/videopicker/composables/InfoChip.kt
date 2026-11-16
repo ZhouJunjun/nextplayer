@@ -33,8 +33,8 @@ fun InfoChip(
             .clip(shape = shape)
             .background(color = backgroundColor)
             .padding(
-                vertical = 1.dp,
-                horizontal = 1.dp,
+                vertical = 0.dp,
+                horizontal = 2.dp,
             ),
     )
 }
