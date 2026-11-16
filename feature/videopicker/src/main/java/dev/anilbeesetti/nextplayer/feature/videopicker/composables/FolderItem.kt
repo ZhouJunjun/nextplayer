@@ -152,7 +152,7 @@ private fun FolderListItem(
                                         ?: R.string.videos,
                             ),
                         modifier = Modifier
-                            .padding(1.dp)
+                            .padding(2.dp)
                             .align(Alignment.BottomEnd),
                         backgroundColor = Color.Black.copy(alpha = 0.6f),
                         contentColor = Color.White,

@@ -34,7 +34,7 @@ fun InfoChip(
             .background(color = backgroundColor)
             .padding(
                 vertical = 1.dp,
-                horizontal = 3.dp,
+                horizontal = 1.dp,
             ),
     )
 }
