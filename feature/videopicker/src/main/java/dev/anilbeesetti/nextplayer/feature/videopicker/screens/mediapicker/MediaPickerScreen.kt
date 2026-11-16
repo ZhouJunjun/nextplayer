@@ -1,8 +1,6 @@
 package dev.anilbeesetti.nextplayer.feature.videopicker.screens.mediapicker
 
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.slideInVertically
@@ -40,7 +38,6 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalIconButton
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -128,8 +125,6 @@ import dev.anilbeesetti.nextplayer.feature.videopicker.composables.vault.VaultPr
 import dev.anilbeesetti.nextplayer.feature.videopicker.screens.vault.VAULT_PIN_LENGTH
 import dev.anilbeesetti.nextplayer.feature.videopicker.state.SelectionItem
 import dev.anilbeesetti.nextplayer.feature.videopicker.state.rememberSelectionManager
-import dev.anilbeesetti.nextplayer.feature.videopicker.state.toSelectedFolder
-import dev.anilbeesetti.nextplayer.feature.videopicker.state.toSelectedVideo
 import kotlin.math.roundToInt
 
 @Composable
@@ -179,33 +174,9 @@ internal fun MediaPickerScreenContent(
         wasPermissionGranted = isPermissionGranted
     }
     val lazyGridState = rememberLazyGridState()
-    val selectVideoFileLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent(),
-        onResult = { uri -> uri?.let { onAction(MediaPickerAction.OnPlayVideo(uri = it)) } },
-    )
-
     var showQuickSettingsDialog by rememberSaveable { mutableStateOf(value = false) }
     var showRenameActionFor: Video? by rememberSaveable { mutableStateOf(value = null) }
     var showDeleteVideosConfirmation by rememberSaveable { mutableStateOf(value = false) }
-
-    val mediaHolder = (state.mediaDataState as? DataState.Success)?.value
-    val onFabClick = {
-        val selectedItem = state.recentlyPlayedVideo?.toSelectedVideo()
-            ?: mediaHolder?.folders?.firstOrNull()?.toSelectedFolder()
-            ?: mediaHolder?.videos?.firstOrNull()?.toSelectedVideo()
-
-        when (selectedItem) {
-            is SelectionItem.Video -> onAction(
-                MediaPickerAction.OnPlayVideo(selectedItem.uriString.toUri()),
-            )
-
-            is SelectionItem.Folder -> onAction(
-                MediaPickerAction.PlaySelectedItems(selectionItems = setOf(element = selectedItem)),
-            )
-
-            null -> selectVideoFileLauncher.launch(input = "video/*")
-        }
-    }
 
     BindTopLevelBottomBarVisible(
         visible =
@@ -386,22 +357,7 @@ internal fun MediaPickerScreenContent(
                 onDeleteAction = { showDeleteVideosConfirmation = true },
             )
         },
-        floatingActionButton = {
-            if (state.folderName != null && !selectionManager.isInSelectionMode) {
-                FloatingActionButton(
-                    onClick = onFabClick,
-                    modifier = Modifier
-                        .tvFocusRing(shape = MaterialTheme.shapes.large)
-                        .focusProperties { if (isTv && hasMedia) up = focusState.requester },
-                    shape = MaterialTheme.shapes.large,
-                ) {
-                    Icon(
-                        imageVector = NextIcons.Play,
-                        contentDescription = stringResource(R.string.play),
-                    )
-                }
-            }
-        },
+        // 右下角的播放 FAB 已按需求移除（首页列表和文件夹内列表都不再有悬浮播放按钮）。
         containerColor = MaterialTheme.colorScheme.surfaceContainer,
     ) { scaffoldPadding ->
         Box(
