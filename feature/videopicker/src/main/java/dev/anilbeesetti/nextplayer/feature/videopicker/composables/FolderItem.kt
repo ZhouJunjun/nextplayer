@@ -29,6 +29,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.PreviewLightDark
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import dev.anilbeesetti.nextplayer.core.common.Utils
 import dev.anilbeesetti.nextplayer.core.model.ApplicationPreferences
 import dev.anilbeesetti.nextplayer.core.model.Folder
@@ -43,6 +44,12 @@ import dev.anilbeesetti.nextplayer.core.ui.theme.NextPlayerTheme
  * 图标与两行文字齐平，右边还能多留出空间。
  */
 private val FOLDER_THUMB_HEIGHT = 48.dp
+
+/**
+ * 文件夹图标右下角「n 视频」标签的字号。
+ * 比 chip 默认的 labelSmall（11sp）小一号，压在图标角上不抢戏。
+ */
+private val FOLDER_COUNT_FONT_SIZE = 10.sp
 
 @Composable
 fun FolderItem(
@@ -150,6 +157,8 @@ private fun FolderListItem(
                         backgroundColor = Color.Black.copy(alpha = 0.6f),
                         contentColor = Color.White,
                         shape = MaterialTheme.shapes.extraSmall,
+                        // 压在图标角上，比正文 chip 小一号（labelSmall 11sp → 10sp）
+                        fontSize = FOLDER_COUNT_FONT_SIZE,
                     )
                 }
             }
@@ -266,6 +275,8 @@ private fun FolderGridItem(
                             backgroundColor = Color.Black.copy(alpha = 0.6f),
                             contentColor = Color.White,
                             shape = MaterialTheme.shapes.extraSmall,
+                            // 压在图标角上，比正文 chip 小一号（labelSmall 11sp → 10sp）
+                            fontSize = FOLDER_COUNT_FONT_SIZE,
                         )
                     }
                 }
