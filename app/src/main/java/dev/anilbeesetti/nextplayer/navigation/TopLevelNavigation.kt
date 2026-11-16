@@ -67,15 +67,12 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.LookaheadScope
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -404,23 +401,14 @@ fun NextNavigationBar(
     showFabOnly: Boolean = false,
 ) {
     val isTv = LocalContext.current.isTelevision
+    // 改回普通贴底横条：不再用向上渐隐的背景，也不再左右留 16dp、底部留 12dp 的悬浮边距，
+    // 整条铺满屏幕底部，和系统导航栏一样贴边。
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .thenIf(condition = !showFabOnly) {
-                background(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(
-                            Color.Transparent,
-                            MaterialTheme.colorScheme.background,
-                        ),
-                    ),
-                )
-            }
+            .background(MaterialTheme.colorScheme.surfaceContainer)
             .navigationBarsPadding()
             .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
-            .padding(bottom = 12.dp)
-            .padding(horizontal = 16.dp)
             .thenIf(condition = !showFabOnly) { pointerInput(key1 = Unit) {} },
         contentAlignment = Alignment.BottomCenter,
     ) {
@@ -507,15 +495,11 @@ fun NavigationView(
     val animationSpec = MaterialTheme.motionScheme.defaultSpatialSpec<Rect>()
     val boundsTransform = remember { BoundsTransform { _, _ -> animationSpec } }
 
+    // 普通贴底横条导航：铺满宽度、直角、无阴影，不再是一个浮在页面上的胶囊。
     Box(
         modifier = modifier
-            .graphicsLayer(
-                shadowElevation = with(LocalDensity.current) { 6.dp.toPx() },
-                shape = CircleShape,
-            )
-            .clip(shape = CircleShape)
-            .background(MaterialTheme.colorScheme.surfaceContainer)
-            .padding(4.dp),
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceContainer),
     ) {
         LookaheadScope {
             val pill = remember {
@@ -535,9 +519,11 @@ fun NavigationView(
                 }
             }
 
+            // 横条里各项均分宽度，和系统底栏的行为一致。
             Row(
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
             ) {
                 destinations.forEach { destination ->
                     val isSelected = isSelected(destination)

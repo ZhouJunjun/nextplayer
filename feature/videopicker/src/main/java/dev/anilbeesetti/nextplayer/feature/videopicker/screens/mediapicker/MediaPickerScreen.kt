@@ -99,14 +99,12 @@ import dev.anilbeesetti.nextplayer.core.model.Video
 import dev.anilbeesetti.nextplayer.core.ui.R
 import dev.anilbeesetti.nextplayer.core.ui.base.DataState
 import dev.anilbeesetti.nextplayer.core.ui.components.BindTopLevelBottomBarVisible
-import dev.anilbeesetti.nextplayer.core.ui.components.BindTopLevelFab
 import dev.anilbeesetti.nextplayer.core.ui.components.CancelButton
 import dev.anilbeesetti.nextplayer.core.ui.components.LocalNavigationBottomPadding
 import dev.anilbeesetti.nextplayer.core.ui.components.NextDialog
 import dev.anilbeesetti.nextplayer.core.ui.components.NextOutlinedTextField
 import dev.anilbeesetti.nextplayer.core.ui.components.NextTopAppBar
 import dev.anilbeesetti.nextplayer.core.ui.components.TextIconToggleButton
-import dev.anilbeesetti.nextplayer.core.ui.components.TopLevelFabKey
 import dev.anilbeesetti.nextplayer.core.ui.components.rememberRestorableFocusState
 import dev.anilbeesetti.nextplayer.core.ui.components.thenIf
 import dev.anilbeesetti.nextplayer.core.ui.components.tvFocusRing
@@ -214,13 +212,7 @@ internal fun MediaPickerScreenContent(
             state.folderName != null || !selectionManager.isInSelectionMode,
     )
 
-    if (state.folderName == null) {
-        BindTopLevelFab(
-            key = TopLevelFabKey.MEDIA,
-            icon = NextIcons.Play,
-            onClick = onFabClick,
-        )
-    }
+    // 右下角的播放 FAB 已按需求移除（列表页不再有悬浮播放按钮）。
 
     val selectedItemsSize = selectionManager.selectionItems.size
     val totalItemsSize =
