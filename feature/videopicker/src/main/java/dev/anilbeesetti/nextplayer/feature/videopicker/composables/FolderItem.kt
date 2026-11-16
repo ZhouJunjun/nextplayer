@@ -145,14 +145,14 @@ private fun FolderListItem(
                 // 视频数量挪到文件夹图标的右下角。
                 if (folder.videosCount > 0) {
                     InfoChip(
-                        text = "${folder.videosCount} " +
+                        text = "${folder.videosCount}" +
                             stringResource(
                                 id =
                                     R.string.video.takeIf { folder.videosCount == 1 }
                                         ?: R.string.videos,
                             ),
                         modifier = Modifier
-                            .padding(2.dp)
+                            .padding(1.dp)
                             .align(Alignment.BottomEnd),
                         backgroundColor = Color.Black.copy(alpha = 0.6f),
                         contentColor = Color.White,
