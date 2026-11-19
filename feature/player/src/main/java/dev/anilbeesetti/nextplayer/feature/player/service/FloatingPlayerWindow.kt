@@ -23,6 +23,7 @@ import android.view.accessibility.CaptioningManager
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.LinearLayout
 import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
@@ -66,6 +67,14 @@ private const val CENTER_BUTTON_PADDING_DP = 32
  * padding 由 (容器 - 图标) / 2 反推，图标居中且不拉伸。
  */
 private const val CENTER_ICON_SIZE_DP = 48
+/**
+ * 【减 n 秒】【加 n 秒】两个按钮的尺寸。
+ *
+ * 触摸区 48dp（Material 最小触摸目标），图标保持 24dp 固有尺寸 —— 需求要求它们
+ * **不像居中按钮那样放大**，所以 padding 按 (48 - 24) / 2 = 12dp 给，图标原样居中。
+ */
+private const val SEEK_BUTTON_SIZE_DP = 48
+private const val SEEK_BUTTON_PADDING_DP = 12
 private const val PROGRESS_BAR_HEIGHT_DP = 3f
 private const val PROGRESS_TOUCH_HEIGHT_DP = 18
 private const val PROGRESS_HORIZONTAL_MARGIN_DP = 8
@@ -141,6 +150,13 @@ internal class FloatingPlayerWindow(
     private val handler = Handler(Looper.getMainLooper())
     private val density = context.resources.displayMetrics.density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+
+    /**
+     * 一次【加/减 n 秒】跳多少。n 跟应用内播放器共用同一个设置项
+     * （`PlayerPreferences.seekIncrement`，默认 10 秒），所以两处行为一致。
+     */
+    private val seekIncrementMs: Long = preferences.seekIncrement.coerceAtLeast(1) * 1000L
+
     private val positionPreferences =
         context.getSharedPreferences(POSITION_PREFERENCES, Context.MODE_PRIVATE)
 
@@ -497,7 +513,7 @@ internal class FloatingPlayerWindow(
             },
         )
 
-        playPauseButton = createButton(
+        val playPause = createButton(
             iconRes = coreUiR.drawable.ic_pause,
             sizeDp = CENTER_BUTTON_SIZE_DP,
             paddingDp = CENTER_BUTTON_PADDING_DP,
@@ -505,6 +521,24 @@ internal class FloatingPlayerWindow(
             // 容器仍是 128dp，点击区域保持大一圈。
             iconSizeDp = CENTER_ICON_SIZE_DP,
             onClick = { togglePlayback() },
+        )
+        playPauseButton = playPause
+        // 【减 n 秒】与【加 n 秒】：与应用内快进反馈同源的 ic_fast，后退那个水平镜像成双左箭头。
+        // 图标保持 24dp（不放大），跟左上/右上那些小按钮一个视觉层级。
+        val seekBackButton = createButton(
+            iconRes = coreUiR.drawable.ic_fast,
+            sizeDp = SEEK_BUTTON_SIZE_DP,
+            paddingDp = SEEK_BUTTON_PADDING_DP,
+            onClick = { seekBy(deltaMs = -seekIncrementMs) },
+        ).apply {
+            // 镜像只影响绘制，触摸区域和布局都不变。
+            scaleX = -1f
+        }
+        val seekForwardButton = createButton(
+            iconRes = coreUiR.drawable.ic_fast,
+            sizeDp = SEEK_BUTTON_SIZE_DP,
+            paddingDp = SEEK_BUTTON_PADDING_DP,
+            onClick = { seekBy(deltaMs = seekIncrementMs) },
         )
         val fullScreenButton = createButton(
             // 与应用内「切小窗」图标同源，箭头改为指向左上（表示回到应用）。
@@ -532,11 +566,23 @@ internal class FloatingPlayerWindow(
         )
 
         val margin = (TOP_BUTTON_MARGIN_DP * density).toInt()
+        // 三个按钮共用一条水平居中的行：减 n 秒、播放/暂停、加 n 秒。
+        // 居中按钮容器 128dp 而图标只有 48dp，本身左右各留 40dp 空白，
+        // 所以两侧的 seek 按钮紧贴着也已经有足够的视觉间距。
+        val centerSize = (CENTER_BUTTON_SIZE_DP * density).toInt()
+        val seekSize = (SEEK_BUTTON_SIZE_DP * density).toInt()
+        val centerRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        centerRow.addView(seekBackButton, LinearLayout.LayoutParams(seekSize, seekSize))
+        centerRow.addView(playPause, LinearLayout.LayoutParams(centerSize, centerSize))
+        centerRow.addView(seekForwardButton, LinearLayout.LayoutParams(seekSize, seekSize))
         container.addView(
-            playPauseButton,
+            centerRow,
             FrameLayout.LayoutParams(
-                (CENTER_BUTTON_SIZE_DP * density).toInt(),
-                (CENTER_BUTTON_SIZE_DP * density).toInt(),
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.CENTER,
             ),
         )
@@ -617,6 +663,27 @@ internal class FloatingPlayerWindow(
         // The player listener refreshes the icon and the controls visibility once the state settles.
         if (player.isPlaying) player.pause() else player.play()
         updateProgress()
+    }
+
+    /**
+     * Jumps [deltaMs] forward or backward, clamped to the video. The step is the same one the full
+     * screen player uses for its skip gestures, so both feel alike.
+     *
+     * The controls stay on screen for another auto hide delay, so a tap does not disappear from
+     * under the finger while something is playing.
+     */
+    private fun seekBy(deltaMs: Long) {
+        val duration = player.duration
+        var target = player.currentPosition + deltaMs
+        if (target < 0) target = 0
+        if (duration > 0 && target > duration) target = duration
+        player.seekTo(target)
+        updateProgress()
+        showControls()
+        handler.removeCallbacks(hideControlsRunnable)
+        if (player.isPlaying) {
+            handler.postDelayed(hideControlsRunnable, CONTROLS_AUTO_HIDE_DELAY_MS)
+        }
     }
 
     /**
